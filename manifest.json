@@ -1,0 +1,7 @@
+{
+  "name": "FakeDMs",
+  "description": "Inject client-side fake messages with real profiles, @mentions, and attachments (.exe, .zip, etc.) into mobile DMs.",
+  "author": "ENI & LO",
+  "version": "1.0.0",
+  "main": "index.js"
+}
