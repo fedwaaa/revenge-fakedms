@@ -15,5 +15,11 @@
   },
   "vendetta": {
     "icon": "ic_message_edit"
+  },
+  "kettu": {
+    "icon": "ic_message_edit"
+  },
+  "bunny": {
+    "icon": "ic_message_edit"
   }
 }

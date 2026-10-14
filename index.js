@@ -1,8 +1,10 @@
 (() => {
-    // ── Safe API Resolver (support imports or global vendetta) ────────────────
-    const v = typeof vendetta !== "undefined" ? vendetta : (typeof window !== "undefined" ? window.vendetta : globalThis.vendetta);
-    const metro = v?.metro;
-    const commands = v?.commands;
+    // ── Safe API Resolver across Kettu, Bunny, and Vendetta ───────────────────
+    const root = typeof window !== "undefined" ? window : (typeof globalThis !== "undefined" ? globalThis : global);
+    const mod = root.kettu || root.bunny || root.vendetta;
+
+    const metro = mod?.metro;
+    const commands = mod?.commands;
 
     const findByProps = (...props) => metro?.findByProps(...props);
 
@@ -134,7 +136,7 @@
             initModules();
 
             if (!commands?.registerCommand) {
-                console.error("[FakeDMs] vendetta.commands.registerCommand not available");
+                console.error("[FakeDMs] registerCommand is not available in Kettu/Bunny/Vendetta");
                 return;
             }
 
@@ -217,7 +219,7 @@
                     const messageId = generateSnowflake();
 
                     if (!FluxDispatcher?.dispatch) {
-                        return { content: "⚠️ FluxDispatcher not available." };
+                        return { content: "⚠️ FluxDispatcher not found in Kettu client." };
                     }
 
                     FluxDispatcher.dispatch({
