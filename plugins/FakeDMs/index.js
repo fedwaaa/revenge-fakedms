@@ -1,0 +1,603 @@
+(() => {
+    "use strict";
+
+    // ── Safe API Resolver across Kettu, Bunny, and Vendetta ───────────────────
+    const root = typeof window !== "undefined" ? window : (typeof globalThis !== "undefined" ? globalThis : global);
+    const mod = root.kettu || root.bunny || root.vendetta || {};
+
+    const metro = mod.metro || {};
+    const patcher = mod.patcher || {};
+    const commands = mod.commands || {};
+    const toasts = mod.ui?.toasts || {};
+    const utils = mod.utils || {};
+
+    const findByProps = (...props) => metro.findByProps ? metro.findByProps(...props) : null;
+    const findInReactTree = utils.findInReactTree || ((tree, filter) => {
+        const stack = [tree];
+        while (stack.length > 0) {
+            const current = stack.pop();
+            if (!current) continue;
+            try {
+                if (filter(current)) return current;
+            } catch {}
+            if (Array.isArray(current)) {
+                for (const item of current) stack.push(item);
+            } else if (typeof current === "object") {
+                if (current.props) stack.push(current.props);
+                if (current.children) stack.push(current.children);
+            }
+        }
+        return null;
+    });
+
+    // ── Metro Modules ────────────────────────────────────────────────────────
+    let FluxDispatcher;
+    let UserStore;
+    let SelectedChannelStore;
+    let ChannelStore;
+    let RelationshipStore;
+    let LazyActionSheet;
+    let MessageActions;
+    let React;
+    let ReactNative;
+
+    function initModules() {
+        try {
+            FluxDispatcher = findByProps("_currentDispatchActionType") || findByProps("dispatch", "subscribe");
+            UserStore = findByProps("getCurrentUser", "getUser");
+            SelectedChannelStore = findByProps("getChannelId");
+            ChannelStore = findByProps("getChannel");
+            RelationshipStore = findByProps("getRelationships", "getFriendIDs");
+            LazyActionSheet = findByProps("openLazy", "hideActionSheet");
+            MessageActions = findByProps("sendMessage", "receiveMessage") || findByProps("sendMessage");
+
+            const common = metro.common || {};
+            React = common.React || root.React;
+            ReactNative = common.ReactNative || root.ReactNative || findByProps("View", "Text");
+        } catch (e) {
+            console.error("[FakeDMs] Error resolving Metro modules:", e);
+        }
+    }
+
+    function notify(text) {
+        try {
+            if (toasts.showToast) {
+                toasts.showToast(text, "ic_message_edit");
+            } else {
+                console.log("[FakeDMs]", text);
+            }
+        } catch {}
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function generateSnowflake() {
+        const DISCORD_EPOCH = 1420070400000n;
+        const ts = BigInt(Date.now()) - DISCORD_EPOCH;
+        return ((ts << 22n) | BigInt(Math.floor(Math.random() * 4194304))).toString();
+    }
+
+    function guessContentType(filename) {
+        const ext = (filename || "").split(".").pop().toLowerCase();
+        const map = {
+            exe: "application/x-msdownload",
+            zip: "application/zip",
+            rar: "application/x-rar-compressed",
+            "7z": "application/x-7z-compressed",
+            tar: "application/x-tar",
+            gz: "application/gzip",
+            pdf: "application/pdf",
+            doc: "application/msword",
+            docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            txt: "text/plain",
+            png: "image/png",
+            jpg: "image/jpeg",
+            jpeg: "image/jpeg",
+            gif: "image/gif",
+            mp4: "video/mp4",
+            mp3: "audio/mpeg"
+        };
+        return map[ext] || "application/octet-stream";
+    }
+
+    function getRandomFileSize(filename) {
+        const ext = (filename || "").split(".").pop().toLowerCase();
+        const ranges = {
+            exe: [1000000, 45000000],
+            zip: [100000, 25000000],
+            rar: [100000, 25000000],
+            "7z": [100000, 20000000],
+            pdf: [50000, 8000000],
+            png: [10000, 4000000],
+            jpg: [15000, 3000000]
+        };
+        const [min, max] = ranges[ext] || [50000, 10000000];
+        return Math.floor(Math.random() * (max - min) + min);
+    }
+
+    // ── Mention Parser ───────────────────────────────────────────────────────
+    function parseMentions(text, channel) {
+        const usersMap = new Map();
+
+        const registerUser = (u) => {
+            if (!u) return;
+            if (u.username) usersMap.set(u.username.toLowerCase(), u);
+            if (u.globalName) usersMap.set(u.globalName.toLowerCase(), u);
+        };
+
+        if (channel?.recipients && UserStore) {
+            channel.recipients.forEach((id) => registerUser(UserStore.getUser(id)));
+        }
+        const self = UserStore?.getCurrentUser();
+        if (self) registerUser(self);
+
+        if (RelationshipStore?.getFriendIDs && UserStore) {
+            try {
+                const friends = RelationshipStore.getFriendIDs();
+                friends.forEach((id) => registerUser(UserStore.getUser(id)));
+            } catch {}
+        }
+
+        const mentionedUsers = [];
+        let parsedText = text;
+
+        const rawRegex = /<@!?(\d+)>/g;
+        let match;
+        while ((match = rawRegex.exec(text)) !== null) {
+            const user = UserStore?.getUser(match[1]);
+            if (user && !mentionedUsers.some((u) => u.id === user.id)) {
+                mentionedUsers.push(user);
+            }
+        }
+
+        const sorted = [...usersMap.entries()].sort((a, b) => b[0].length - a[0].length);
+        for (const [name, user] of sorted) {
+            const regex = new RegExp(`@${name.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\b`, "gi");
+            if (regex.test(parsedText)) {
+                parsedText = parsedText.replace(regex, `<@${user.id}>`);
+                if (!mentionedUsers.some((u) => u.id === user.id)) {
+                    mentionedUsers.push(user);
+                }
+            }
+        }
+
+        const mentionEveryone = /@everyone/i.test(parsedText) || /@here/i.test(parsedText);
+
+        const mentions = mentionedUsers.map((u) => ({
+            id: u.id,
+            username: u.username,
+            global_name: u.globalName || u.username,
+            avatar: u.avatar,
+            discriminator: u.discriminator || "0",
+            public_flags: u.publicFlags || 0,
+            bot: false
+        }));
+
+        return { parsedText, mentions, mentionEveryone };
+    }
+
+    // ── Core Injection Engine ────────────────────────────────────────────────
+    function injectFakeMessage({ text, fileName, fileUrl, asSelf, channelId }) {
+        initModules();
+
+        const targetChannelId = channelId || SelectedChannelStore?.getChannelId();
+        const channel = ChannelStore?.getChannel(targetChannelId);
+
+        if (!channel || (channel.type !== 1 && channel.type !== 3)) {
+            notify("⚠️ Please open a DM or Group DM first!");
+            return false;
+        }
+
+        const currentUser = UserStore?.getCurrentUser();
+        let sender = currentUser;
+
+        if (!asSelf) {
+            const recipientId = channel.recipients?.find((id) => id !== currentUser.id);
+            if (recipientId && UserStore) {
+                sender = UserStore.getUser(recipientId) || currentUser;
+            }
+        }
+
+        const { parsedText, mentions, mentionEveryone } = parseMentions(text || "", channel);
+
+        const attachments = [];
+        if (fileName) {
+            const attachId = generateSnowflake();
+            const dlUrl = fileUrl || `https://cdn.discordapp.com/attachments/0/${attachId}/${encodeURIComponent(fileName)}`;
+            attachments.push({
+                id: attachId,
+                filename: fileName,
+                size: getRandomFileSize(fileName),
+                url: dlUrl,
+                proxy_url: dlUrl,
+                content_type: guessContentType(fileName),
+                spoiler: false
+            });
+        }
+
+        const messageId = generateSnowflake();
+
+        if (!FluxDispatcher?.dispatch) {
+            notify("⚠️ FluxDispatcher not available.");
+            return false;
+        }
+
+        FluxDispatcher.dispatch({
+            type: "MESSAGE_CREATE",
+            channelId: targetChannelId,
+            message: {
+                id: messageId,
+                type: 0,
+                channel_id: targetChannelId,
+                author: {
+                    id: sender.id,
+                    username: sender.username,
+                    global_name: sender.globalName || sender.username,
+                    avatar: sender.avatar,
+                    discriminator: sender.discriminator || "0",
+                    public_flags: sender.publicFlags || 0,
+                    bot: false
+                },
+                content: parsedText,
+                timestamp: new Date().toISOString(),
+                edited_timestamp: null,
+                tts: false,
+                mention_everyone: mentionEveryone,
+                mentions: mentions,
+                mention_roles: [],
+                attachments: attachments,
+                embeds: [],
+                reactions: [],
+                pinned: false,
+                flags: 0
+            },
+            optimistic: false,
+            isPushNotification: false
+        });
+
+        notify(`✨ Injected as ${sender.globalName || sender.username}!`);
+        return true;
+    }
+
+    // ── React Native Composer Component ───────────────────────────────────────
+    function ComposerView({ onClose }) {
+        initModules();
+        if (!React || !ReactNative) return null;
+
+        const { View, Text, TextInput, TouchableOpacity, ScrollView } = ReactNative;
+        const [messageText, setMessageText] = React.useState("");
+        const [fileName, setFileName] = React.useState("");
+        const [asSelf, setAsSelf] = React.useState(false);
+
+        const currentChannelId = SelectedChannelStore?.getChannelId();
+        const channel = ChannelStore?.getChannel(currentChannelId);
+        const currentUser = UserStore?.getCurrentUser();
+        const otherUserId = channel?.recipients?.find((id) => id !== currentUser?.id);
+        const otherUser = otherUserId ? UserStore?.getUser(otherUserId) : null;
+
+        const otherName = otherUser?.globalName || otherUser?.username || "Them";
+        const myName = currentUser?.globalName || currentUser?.username || "You";
+
+        const handleInject = () => {
+            if (!messageText.trim() && !fileName.trim()) {
+                notify("⚠️ Enter a message or filename!");
+                return;
+            }
+
+            const success = injectFakeMessage({
+                text: messageText,
+                fileName: fileName.trim() || null,
+                asSelf: asSelf,
+                channelId: currentChannelId
+            });
+
+            if (success) {
+                setMessageText("");
+                setFileName("");
+                if (typeof onClose === "function") onClose();
+                if (LazyActionSheet?.hideActionSheet) LazyActionSheet.hideActionSheet();
+            }
+        };
+
+        return React.createElement(ScrollView, {
+            style: { padding: 16, backgroundColor: "#1e1f22", borderRadius: 12 },
+            contentContainerStyle: { paddingBottom: 32 }
+        },
+            // Title Header
+            React.createElement(Text, {
+                style: { color: "#ffffff", fontSize: 18, fontWeight: "bold", marginBottom: 4 }
+            }, "⚡ Fake DM Composer"),
+            React.createElement(Text, {
+                style: { color: "#949ba4", fontSize: 12, marginBottom: 16 }
+            }, channel ? `Target: #${channel.name || otherName}` : "Open a DM to target"),
+
+            // Sender Switch Button
+            React.createElement(TouchableOpacity, {
+                style: {
+                    backgroundColor: asSelf ? "#248046" : "#5865F2",
+                    padding: 12,
+                    borderRadius: 8,
+                    alignItems: "center",
+                    marginBottom: 14
+                },
+                onPress: () => setAsSelf(!asSelf)
+            },
+                React.createElement(Text, {
+                    style: { color: "#ffffff", fontWeight: "bold", fontSize: 14 }
+                }, asSelf ? `👤 Sending as: ${myName} (You)` : `🎭 Sending as: ${otherName}`)
+            ),
+
+            // Message Input
+            React.createElement(Text, {
+                style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold", marginBottom: 6 }
+            }, "MESSAGE TEXT (@mentions & links supported)"),
+            React.createElement(TextInput, {
+                style: {
+                    backgroundColor: "#2b2d31",
+                    color: "#ffffff",
+                    borderRadius: 8,
+                    padding: 12,
+                    fontSize: 14,
+                    minHeight: 70,
+                    textAlignVertical: "top",
+                    marginBottom: 14
+                },
+                placeholder: "Type fake message here...",
+                placeholderTextColor: "#6d6f78",
+                multiline: true,
+                value: messageText,
+                onChangeText: setMessageText
+            }),
+
+            // File Attachment Input
+            React.createElement(Text, {
+                style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold", marginBottom: 6 }
+            }, "FILE ATTACHMENT (.exe, .zip, .pdf, images, etc.)"),
+            React.createElement(TextInput, {
+                style: {
+                    backgroundColor: "#2b2d31",
+                    color: "#ffffff",
+                    borderRadius: 8,
+                    padding: 12,
+                    fontSize: 14,
+                    marginBottom: 16
+                },
+                placeholder: "e.g. payload.exe, classified.zip (optional)",
+                placeholderTextColor: "#6d6f78",
+                value: fileName,
+                onChangeText: setFileName
+            }),
+
+            // Inject Button
+            React.createElement(TouchableOpacity, {
+                style: {
+                    backgroundColor: "#5865F2",
+                    padding: 14,
+                    borderRadius: 8,
+                    alignItems: "center",
+                    marginBottom: 10
+                },
+                onPress: handleInject
+            },
+                React.createElement(Text, {
+                    style: { color: "#ffffff", fontWeight: "bold", fontSize: 16 }
+                }, "⚡ Inject Message Locally")
+            ),
+
+            // Quick hint
+            React.createElement(Text, {
+                style: { color: "#6d6f78", fontSize: 11, textAlign: "center" }
+            }, "Client-side only. You can also type !fake <text> directly in chat!")
+        );
+    }
+
+    function openComposer() {
+        initModules();
+        if (LazyActionSheet?.openLazy) {
+            LazyActionSheet.openLazy(
+                Promise.resolve({ default: () => React.createElement(ComposerView, { onClose: () => LazyActionSheet.hideActionSheet() }) }),
+                "FakeDMComposer"
+            );
+        } else {
+            notify("⚠️ Could not open composer sheet.");
+        }
+    }
+
+    let unpatches = [];
+
+    const plugin = {
+        onLoad: () => {
+            initModules();
+            unpatches = [];
+
+            // ════════════════════════════════════════════════════════════════════
+            // 1. Hook the + Button and Chat Action Sheets to add "⚡ Fake DM"
+            // ════════════════════════════════════════════════════════════════════
+            if (LazyActionSheet?.openLazy && patcher.before) {
+                try {
+                    const unpatchSheet = patcher.before("openLazy", LazyActionSheet, (args) => {
+                        const [component] = args;
+                        if (!component || typeof component.then !== "function") return;
+
+                        component.then((instance) => {
+                            if (!instance || !instance.default || !patcher.after) return;
+                            const unpatchRender = patcher.after("default", instance, (_, res) => {
+                                try {
+                                    if (!React || !ReactNative) return;
+                                    const { TouchableOpacity, Text } = ReactNative;
+
+                                    const targetList = findInReactTree(res, (x) =>
+                                        Array.isArray(x) && x.some((item) =>
+                                            item?.props?.label || item?.props?.title || item?.type?.name === "ButtonRow" || item?.props?.leading
+                                        )
+                                    );
+
+                                    if (targetList && !targetList.some((item) => item?.key === "fakedm-action-btn")) {
+                                        targetList.unshift(
+                                            React.createElement(TouchableOpacity, {
+                                                key: "fakedm-action-btn",
+                                                style: {
+                                                    flexDirection: "row",
+                                                    alignItems: "center",
+                                                    padding: 14,
+                                                    backgroundColor: "#2b2d31",
+                                                    borderRadius: 8,
+                                                    marginVertical: 4
+                                                },
+                                                onPress: () => {
+                                                    LazyActionSheet.hideActionSheet();
+                                                    setTimeout(() => openComposer(), 250);
+                                                }
+                                            },
+                                                React.createElement(Text, {
+                                                    style: { color: "#5865F2", fontWeight: "bold", fontSize: 15 }
+                                                }, "⚡ Fake DM Composer")
+                                            )
+                                        );
+                                    }
+                                } catch {}
+                            });
+                            unpatches.push(unpatchRender);
+                        });
+                    });
+                    unpatches.push(unpatchSheet);
+                    console.log("[FakeDMs] ActionSheet patch registered!");
+                } catch (e) {
+                    console.error("[FakeDMs] ActionSheet patch error:", e);
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════════
+            // 2. Chat Prefix: !fake <message> [--file name.exe] [--me]
+            // ════════════════════════════════════════════════════════════════════
+            if (MessageActions?.sendMessage && patcher.instead) {
+                try {
+                    const unpatchSend = patcher.instead("sendMessage", MessageActions, (args, orig) => {
+                        const [channelId, msgObj] = args;
+                        const content = msgObj?.content ? msgObj.content.trim() : "";
+
+                        if (content.startsWith("!fake ") || content.startsWith("!fakedm ")) {
+                            let raw = content.replace(/^!(fakedm|fake)\s+/, "");
+
+                            let asSelf = false;
+                            if (raw.includes("--me")) {
+                                asSelf = true;
+                                raw = raw.replace("--me", "").trim();
+                            }
+
+                            let fileName = null;
+                            const fileMatch = raw.match(/--file\s+([^\s]+)/i);
+                            if (fileMatch) {
+                                fileName = fileMatch[1];
+                                raw = raw.replace(fileMatch[0], "").trim();
+                            }
+
+                            let fileUrl = null;
+                            const urlMatch = raw.match(/--url\s+([^\s]+)/i);
+                            if (urlMatch) {
+                                fileUrl = urlMatch[1];
+                                raw = raw.replace(urlMatch[0], "").trim();
+                            }
+
+                            injectFakeMessage({
+                                text: raw,
+                                fileName: fileName,
+                                fileUrl: fileUrl,
+                                asSelf: asSelf,
+                                channelId: channelId
+                            });
+
+                            return Promise.resolve();
+                        }
+
+                        return orig(...args);
+                    });
+                    unpatches.push(unpatchSend);
+                    console.log("[FakeDMs] Chat interceptor active!");
+                } catch (e) {
+                    console.error("[FakeDMs] sendMessage patch error:", e);
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════════
+            // 3. Slash Command: /fakedm with complete required descriptors
+            // ════════════════════════════════════════════════════════════════════
+            const register = commands.registerCommand || mod.commands?.registerCommand;
+            if (typeof register === "function") {
+                try {
+                    const unregisterCmd = register({
+                        name: "fakedm",
+                        displayName: "fakedm",
+                        description: "Inject client-sided DM messages with real profiles, @mentions, & attachments",
+                        displayDescription: "Inject client-sided DM messages with real profiles, @mentions, & attachments",
+                        type: 1,
+                        inputType: 0,
+                        applicationId: "-1",
+                        options: [
+                            {
+                                name: "message",
+                                displayName: "message",
+                                description: "Message text (@mentions and links work)",
+                                displayDescription: "Message text (@mentions and links work)",
+                                type: 3,
+                                required: true
+                            },
+                            {
+                                name: "file",
+                                displayName: "file",
+                                description: "Attachment filename with extension (e.g. payload.exe, archive.zip)",
+                                displayDescription: "Attachment filename with extension (e.g. payload.exe, archive.zip)",
+                                type: 3,
+                                required: false
+                            },
+                            {
+                                name: "url",
+                                displayName: "url",
+                                description: "Optional custom download URL for the file",
+                                displayDescription: "Optional custom download URL for the file",
+                                type: 3,
+                                required: false
+                            },
+                            {
+                                name: "as_self",
+                                displayName: "as_self",
+                                description: "Send as yourself instead of the other person? (true/false)",
+                                displayDescription: "Send as yourself instead of the other person? (true/false)",
+                                type: 5,
+                                required: false
+                            }
+                        ],
+                        execute: (args, ctx) => {
+                            const rawText = args.find((a) => a.name === "message")?.value || "";
+                            const fileName = args.find((a) => a.name === "file")?.value;
+                            const fileUrl = args.find((a) => a.name === "url")?.value;
+                            const asSelf = args.find((a) => a.name === "as_self")?.value || false;
+
+                            injectFakeMessage({
+                                text: rawText,
+                                fileName,
+                                fileUrl,
+                                asSelf,
+                                channelId: ctx?.channel?.id
+                            });
+                        }
+                    });
+                    if (typeof unregisterCmd === "function") unpatches.push(unregisterCmd);
+                } catch (e) {}
+            }
+
+            notify("✨ FakeDMs v3.4 ready! Tap + in chat or use Settings ⚙️");
+        },
+        onUnload: () => {
+            unpatches.forEach((u) => {
+                try {
+                    if (typeof u === "function") u();
+                } catch {}
+            });
+            unpatches = [];
+        },
+        // Settings page renderer (gear icon in Plugins list)
+        settings: ComposerView
+    };
+
+    return plugin;
+})();
