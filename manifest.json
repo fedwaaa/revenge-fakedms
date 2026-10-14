@@ -7,7 +7,7 @@
       "id": "0"
     }
   ],
-  "main": "index.js",
+  "main": "https://raw.githubusercontent.com/fedwaaa/revenge-fakedms/main/index.js",
   "vendetta": {
     "icon": "ic_message_edit"
   },
