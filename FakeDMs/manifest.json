@@ -1,0 +1,15 @@
+{
+  "name": "FakeDMs",
+  "description": "Inject client-side fake messages with real profiles, @mentions, and attachments (.exe, .zip, etc.) into mobile DMs.",
+  "authors": [
+    {
+      "name": "fedwaaa",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_message_edit"
+  },
+  "hash": "df7b0b517e4d77dd44b9135be04b71a8a25ec83467d07fd49b5bc812b80839eb"
+}
