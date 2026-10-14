@@ -30,6 +30,9 @@
         return null;
     });
 
+    // ── Memory Store for Injected Messages (Channel Persistence) ──────────────
+    const fakeMessagesByChannel = new Map();
+
     // ── Metro Modules ────────────────────────────────────────────────────────
     let FluxDispatcher;
     let UserStore;
@@ -228,6 +231,31 @@
         return { parsedText, mentions, mentionEveryone };
     }
 
+    // ── Re-Inject Messages into Channel View ──────────────────────────────────
+    function restoreFakeMessages(channelId) {
+        if (!channelId || !fakeMessagesByChannel.has(channelId)) return;
+        const list = fakeMessagesByChannel.get(channelId);
+        if (!Array.isArray(list) || list.length === 0) return;
+
+        initModules();
+        if (!FluxDispatcher?.dispatch) return;
+
+        for (const msg of list) {
+            try {
+                FluxDispatcher.dispatch({
+                    type: "MESSAGE_CREATE",
+                    channelId: channelId,
+                    message: msg,
+                    optimistic: false,
+                    sendMessageOptions: {},
+                    isPushNotification: false
+                });
+            } catch (e) {
+                console.error("[FakeDMs] Error restoring message:", e);
+            }
+        }
+    }
+
     // ── Core Injection Engine ────────────────────────────────────────────────
     function injectFakeMessage({ text, fileName, fileUrl, asSelf, channelId }) {
         initModules();
@@ -274,36 +302,46 @@
             return false;
         }
 
+        const message = {
+            id: messageId,
+            type: 0,
+            channel_id: targetChannelId,
+            author: {
+                id: sender.id,
+                username: sender.username,
+                global_name: sender.globalName || sender.username,
+                avatar: sender.avatar,
+                discriminator: sender.discriminator || "0",
+                public_flags: sender.publicFlags || 0,
+                bot: false
+            },
+            content: parsedText,
+            timestamp: new Date().toISOString(),
+            edited_timestamp: null,
+            tts: false,
+            mention_everyone: mentionEveryone,
+            mentions: mentions,
+            mention_roles: [],
+            attachments: attachments,
+            embeds: [],
+            reactions: [],
+            pinned: false,
+            flags: 0
+        };
+
+        // Save to persistent channel list
+        if (!fakeMessagesByChannel.has(targetChannelId)) {
+            fakeMessagesByChannel.set(targetChannelId, []);
+        }
+        fakeMessagesByChannel.get(targetChannelId).push(message);
+
+        // Dispatch into local view immediately
         FluxDispatcher.dispatch({
             type: "MESSAGE_CREATE",
             channelId: targetChannelId,
-            message: {
-                id: messageId,
-                type: 0,
-                channel_id: targetChannelId,
-                author: {
-                    id: sender.id,
-                    username: sender.username,
-                    global_name: sender.globalName || sender.username,
-                    avatar: sender.avatar,
-                    discriminator: sender.discriminator || "0",
-                    public_flags: sender.publicFlags || 0,
-                    bot: false
-                },
-                content: parsedText,
-                timestamp: new Date().toISOString(),
-                edited_timestamp: null,
-                tts: false,
-                mention_everyone: mentionEveryone,
-                mentions: mentions,
-                mention_roles: [],
-                attachments: attachments,
-                embeds: [],
-                reactions: [],
-                pinned: false,
-                flags: 0
-            },
+            message: message,
             optimistic: false,
+            sendMessageOptions: {},
             isPushNotification: false
         });
 
@@ -311,7 +349,7 @@
         return true;
     }
 
-    // ── React Native Composer with DM Selector ────────────────────────────────
+    // ── React Native Composer with DM Selector & Persistence ──────────────────
     function ComposerView({ onClose }) {
         initModules();
         if (!React || !ReactNative) return null;
@@ -325,7 +363,6 @@
         const allDMs = React.useMemo(() => getAllDMChannels(), []);
         const activeChannelId = SelectedChannelStore?.getChannelId();
 
-        // Default to active DM, or first available DM
         const initialChannelId = (allDMs.find(c => c.id === activeChannelId) || allDMs[0])?.id || null;
         const [targetChannelId, setTargetChannelId] = React.useState(initialChannelId);
 
@@ -336,6 +373,10 @@
 
         const otherName = otherUser?.globalName || otherUser?.username || selectedChannel?.name || "Target User";
         const myName = currentUser?.globalName || currentUser?.username || "You";
+
+        const injectedCount = targetChannelId && fakeMessagesByChannel.has(targetChannelId)
+            ? fakeMessagesByChannel.get(targetChannelId).length
+            : 0;
 
         const handleInject = () => {
             if (!targetChannelId) {
@@ -365,7 +406,15 @@
         const handleJumpToDM = () => {
             if (targetChannelId && PrivateChannelActions?.selectPrivateChannel) {
                 PrivateChannelActions.selectPrivateChannel(targetChannelId);
+                setTimeout(() => restoreFakeMessages(targetChannelId), 200);
                 notify(`Switched to DM with ${otherName}`);
+            }
+        };
+
+        const handleClearFakes = () => {
+            if (targetChannelId && fakeMessagesByChannel.has(targetChannelId)) {
+                fakeMessagesByChannel.delete(targetChannelId);
+                notify(`🗑 Cleared fake messages for DM with ${otherName}`);
             }
         };
 
@@ -453,12 +502,16 @@
                 )
             ) : null,
 
-            // Quick Jump Button
-            targetChannelId ? React.createElement(TouchableOpacity, {
-                style: { alignSelf: "flex-end", marginBottom: 14 },
-                onPress: handleJumpToDM
+            // Quick Jump and Clear Row
+            targetChannelId ? React.createElement(View, {
+                style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }
             },
-                React.createElement(Text, { style: { color: "#00aff4", fontSize: 12, fontWeight: "600" } }, `➔ Open DM with ${otherName}`)
+                React.createElement(TouchableOpacity, { onPress: handleJumpToDM },
+                    React.createElement(Text, { style: { color: "#00aff4", fontSize: 12, fontWeight: "600" } }, `➔ Open DM with ${otherName}`)
+                ),
+                injectedCount > 0 ? React.createElement(TouchableOpacity, { onPress: handleClearFakes },
+                    React.createElement(Text, { style: { color: "#ed4245", fontSize: 12, fontWeight: "600" } }, `🗑 Clear (${injectedCount})`)
+                ) : null
             ) : null,
 
             // ── SENDER TOGGLE BUTTON ──
@@ -537,7 +590,7 @@
             // Quick hint
             React.createElement(Text, {
                 style: { color: "#6d6f78", fontSize: 11, textAlign: "center" }
-            }, "Purely client-side prop. Nothing is ever sent to Discord servers.")
+            }, "Messages stay saved in the DM automatically! Tap Clear to remove.")
         );
     }
 
@@ -560,7 +613,41 @@
             initModules();
             unpatches = [];
 
+            // ════════════════════════════════════════════════════════════════════
+            // 0. Auto-Restore Injected Messages When Switching/Loading Channels
+            // ════════════════════════════════════════════════════════════════════
+            if (FluxDispatcher?.subscribe) {
+                try {
+                    const handleFluxEvent = (event) => {
+                        if (!event) return;
+                        const eventType = event.type;
+                        if (eventType === "LOAD_MESSAGES_SUCCESS" || eventType === "CHANNEL_SELECT") {
+                            const chId = event.channelId;
+                            if (chId && fakeMessagesByChannel.has(chId)) {
+                                setTimeout(() => restoreFakeMessages(chId), 120);
+                                setTimeout(() => restoreFakeMessages(chId), 500);
+                            }
+                        }
+                    };
+
+                    FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
+                    FluxDispatcher.subscribe("CHANNEL_SELECT", handleFluxEvent);
+
+                    unpatches.push(() => {
+                        try {
+                            FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
+                            FluxDispatcher.unsubscribe("CHANNEL_SELECT", handleFluxEvent);
+                        } catch {}
+                    });
+                    console.log("[FakeDMs] Auto-restore listener active!");
+                } catch (e) {
+                    console.error("[FakeDMs] Flux subscribe error:", e);
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════════
             // 1. Hook the + Button and Chat Action Sheets to add "⚡ Fake DM"
+            // ════════════════════════════════════════════════════════════════════
             if (LazyActionSheet?.openLazy && patcher.before) {
                 try {
                     const unpatchSheet = patcher.before("openLazy", LazyActionSheet, (args) => {
@@ -612,7 +699,9 @@
                 } catch (e) {}
             }
 
+            // ════════════════════════════════════════════════════════════════════
             // 2. Chat Prefix: !fake <message> [--file name.exe] [--me]
+            // ════════════════════════════════════════════════════════════════════
             if (MessageActions?.sendMessage && patcher.instead) {
                 try {
                     const unpatchSend = patcher.instead("sendMessage", MessageActions, (args, orig) => {
@@ -659,7 +748,9 @@
                 } catch (e) {}
             }
 
+            // ════════════════════════════════════════════════════════════════════
             // 3. Slash Command: /fakedm
+            // ════════════════════════════════════════════════════════════════════
             const register = commands.registerCommand || mod.commands?.registerCommand;
             if (typeof register === "function") {
                 try {
@@ -724,7 +815,7 @@
                 } catch (e) {}
             }
 
-            notify("✨ FakeDMs v3.5 loaded! Pick any DM inside settings ⚙️");
+            notify("✨ FakeDMs v3.6 active! Messages persist across channel switches.");
         },
         onUnload: () => {
             unpatches.forEach((u) => {
