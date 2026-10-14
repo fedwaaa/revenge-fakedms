@@ -38,6 +38,7 @@
     let RelationshipStore;
     let LazyActionSheet;
     let MessageActions;
+    let PrivateChannelActions;
     let React;
     let ReactNative;
 
@@ -50,6 +51,7 @@
             RelationshipStore = findByProps("getRelationships", "getFriendIDs");
             LazyActionSheet = findByProps("openLazy", "hideActionSheet");
             MessageActions = findByProps("sendMessage", "receiveMessage") || findByProps("sendMessage");
+            PrivateChannelActions = findByProps("selectPrivateChannel");
 
             const common = metro.common || {};
             React = common.React || root.React;
@@ -112,6 +114,57 @@
         };
         const [min, max] = ranges[ext] || [50000, 10000000];
         return Math.floor(Math.random() * (max - min) + min);
+    }
+
+    function getAvatarUrl(user) {
+        if (!user) return null;
+        if (user.avatar) {
+            return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64`;
+        }
+        const defaultNum = (BigInt(user.id || 0) >> 22n) % 6n;
+        return `https://cdn.discordapp.com/embed/avatars/${defaultNum}.png`;
+    }
+
+    // ── Get All DMs ──────────────────────────────────────────────────────────
+    function getAllDMChannels() {
+        initModules();
+        const dms = [];
+        const seen = new Set();
+
+        const addChannel = (c) => {
+            if (!c || seen.has(c.id)) return;
+            if (c.type === 1 || c.type === 3) {
+                seen.add(c.id);
+                dms.push(c);
+            }
+        };
+
+        if (typeof ChannelStore?.getSortedPrivateChannels === "function") {
+            try {
+                const list = ChannelStore.getSortedPrivateChannels();
+                if (Array.isArray(list)) list.forEach(addChannel);
+            } catch {}
+        }
+
+        if (dms.length === 0 && typeof ChannelStore?.getDMChannelIds === "function") {
+            try {
+                const ids = ChannelStore.getDMChannelIds();
+                if (Array.isArray(ids)) {
+                    ids.forEach((id) => addChannel(ChannelStore.getChannel(id)));
+                }
+            } catch {}
+        }
+
+        if (dms.length === 0 && ChannelStore?.getChannels) {
+            try {
+                const all = ChannelStore.getChannels();
+                if (all) {
+                    for (const key in all) addChannel(all[key]);
+                }
+            } catch {}
+        }
+
+        return dms;
     }
 
     // ── Mention Parser ───────────────────────────────────────────────────────
@@ -183,7 +236,7 @@
         const channel = ChannelStore?.getChannel(targetChannelId);
 
         if (!channel || (channel.type !== 1 && channel.type !== 3)) {
-            notify("⚠️ Please open a DM or Group DM first!");
+            notify("⚠️ Please select a DM from the list first!");
             return false;
         }
 
@@ -258,26 +311,37 @@
         return true;
     }
 
-    // ── React Native Composer Component ───────────────────────────────────────
+    // ── React Native Composer with DM Selector ────────────────────────────────
     function ComposerView({ onClose }) {
         initModules();
         if (!React || !ReactNative) return null;
 
-        const { View, Text, TextInput, TouchableOpacity, ScrollView } = ReactNative;
+        const { View, Text, TextInput, TouchableOpacity, ScrollView, Image } = ReactNative;
         const [messageText, setMessageText] = React.useState("");
         const [fileName, setFileName] = React.useState("");
         const [asSelf, setAsSelf] = React.useState(false);
+        const [showPicker, setShowPicker] = React.useState(false);
 
-        const currentChannelId = SelectedChannelStore?.getChannelId();
-        const channel = ChannelStore?.getChannel(currentChannelId);
+        const allDMs = React.useMemo(() => getAllDMChannels(), []);
+        const activeChannelId = SelectedChannelStore?.getChannelId();
+
+        // Default to active DM, or first available DM
+        const initialChannelId = (allDMs.find(c => c.id === activeChannelId) || allDMs[0])?.id || null;
+        const [targetChannelId, setTargetChannelId] = React.useState(initialChannelId);
+
+        const selectedChannel = ChannelStore?.getChannel(targetChannelId) || allDMs.find(c => c.id === targetChannelId);
         const currentUser = UserStore?.getCurrentUser();
-        const otherUserId = channel?.recipients?.find((id) => id !== currentUser?.id);
+        const otherUserId = selectedChannel?.recipients?.find((id) => id !== currentUser?.id);
         const otherUser = otherUserId ? UserStore?.getUser(otherUserId) : null;
 
-        const otherName = otherUser?.globalName || otherUser?.username || "Them";
+        const otherName = otherUser?.globalName || otherUser?.username || selectedChannel?.name || "Target User";
         const myName = currentUser?.globalName || currentUser?.username || "You";
 
         const handleInject = () => {
+            if (!targetChannelId) {
+                notify("⚠️ Please select a DM conversation first!");
+                return;
+            }
             if (!messageText.trim() && !fileName.trim()) {
                 notify("⚠️ Enter a message or filename!");
                 return;
@@ -287,7 +351,7 @@
                 text: messageText,
                 fileName: fileName.trim() || null,
                 asSelf: asSelf,
-                channelId: currentChannelId
+                channelId: targetChannelId
             });
 
             if (success) {
@@ -298,23 +362,110 @@
             }
         };
 
+        const handleJumpToDM = () => {
+            if (targetChannelId && PrivateChannelActions?.selectPrivateChannel) {
+                PrivateChannelActions.selectPrivateChannel(targetChannelId);
+                notify(`Switched to DM with ${otherName}`);
+            }
+        };
+
         return React.createElement(ScrollView, {
             style: { padding: 16, backgroundColor: "#1e1f22", borderRadius: 12 },
-            contentContainerStyle: { paddingBottom: 32 }
+            contentContainerStyle: { paddingBottom: 36 }
         },
             // Title Header
             React.createElement(Text, {
-                style: { color: "#ffffff", fontSize: 18, fontWeight: "bold", marginBottom: 4 }
+                style: { color: "#ffffff", fontSize: 20, fontWeight: "bold", marginBottom: 4 }
             }, "⚡ Fake DM Composer"),
             React.createElement(Text, {
-                style: { color: "#949ba4", fontSize: 12, marginBottom: 16 }
-            }, channel ? `Target: #${channel.name || otherName}` : "Open a DM to target"),
+                style: { color: "#949ba4", fontSize: 13, marginBottom: 14 }
+            }, "Choose who you want to fake a conversation with:"),
 
-            // Sender Switch Button
+            // ── TARGET DM SELECTOR BAR ──
+            React.createElement(TouchableOpacity, {
+                style: {
+                    flexDirection: "row",
+                    alignItems: "center",
+                    backgroundColor: "#2b2d31",
+                    padding: 12,
+                    borderRadius: 10,
+                    borderWidth: 1,
+                    borderColor: "#5865F2",
+                    marginBottom: 10
+                },
+                onPress: () => setShowPicker(!showPicker)
+            },
+                otherUser ? React.createElement(Image, {
+                    source: { uri: getAvatarUrl(otherUser) },
+                    style: { width: 34, height: 34, borderRadius: 17, marginRight: 10 }
+                }) : null,
+                React.createElement(View, { style: { flex: 1 } },
+                    React.createElement(Text, { style: { color: "#949ba4", fontSize: 11, fontWeight: "bold" } }, "TARGET CONVERSATION"),
+                    React.createElement(Text, { style: { color: "#ffffff", fontSize: 15, fontWeight: "bold" } }, otherName)
+                ),
+                React.createElement(Text, { style: { color: "#5865F2", fontWeight: "bold", fontSize: 13 } }, showPicker ? "▲ Hide" : "▼ Change DM")
+            ),
+
+            // ── EXPANDABLE DM LIST ──
+            showPicker ? React.createElement(View, {
+                style: {
+                    backgroundColor: "#232428",
+                    borderRadius: 8,
+                    padding: 6,
+                    marginBottom: 14,
+                    maxHeight: 200
+                }
+            },
+                React.createElement(ScrollView, { nestedScrollEnabled: true },
+                    allDMs.length === 0 ? React.createElement(Text, {
+                        style: { color: "#949ba4", padding: 10, textAlign: "center" }
+                    }, "No recent DMs found.") : allDMs.map((c) => {
+                        const recId = c.recipients?.find(id => id !== currentUser?.id);
+                        const recUser = recId ? UserStore?.getUser(recId) : null;
+                        const label = recUser?.globalName || recUser?.username || c.name || `Chat (${c.id.slice(-4)})`;
+                        const isSelected = c.id === targetChannelId;
+
+                        return React.createElement(TouchableOpacity, {
+                            key: c.id,
+                            style: {
+                                flexDirection: "row",
+                                alignItems: "center",
+                                padding: 10,
+                                backgroundColor: isSelected ? "#35373c" : "transparent",
+                                borderRadius: 6,
+                                marginBottom: 2
+                            },
+                            onPress: () => {
+                                setTargetChannelId(c.id);
+                                setShowPicker(false);
+                            }
+                        },
+                            recUser ? React.createElement(Image, {
+                                source: { uri: getAvatarUrl(recUser) },
+                                style: { width: 26, height: 26, borderRadius: 13, marginRight: 8 }
+                            }) : null,
+                            React.createElement(Text, {
+                                style: { color: isSelected ? "#5865F2" : "#dbdee1", fontWeight: isSelected ? "bold" : "normal", fontSize: 14, flex: 1 }
+                            }, label),
+                            isSelected ? React.createElement(Text, { style: { color: "#5865F2" } }, "✓") : null
+                        );
+                    })
+                )
+            ) : null,
+
+            // Quick Jump Button
+            targetChannelId ? React.createElement(TouchableOpacity, {
+                style: { alignSelf: "flex-end", marginBottom: 14 },
+                onPress: handleJumpToDM
+            },
+                React.createElement(Text, { style: { color: "#00aff4", fontSize: 12, fontWeight: "600" } }, `➔ Open DM with ${otherName}`)
+            ) : null,
+
+            // ── SENDER TOGGLE BUTTON ──
             React.createElement(TouchableOpacity, {
                 style: {
                     backgroundColor: asSelf ? "#248046" : "#5865F2",
-                    padding: 12,
+                    padding: 13,
                     borderRadius: 8,
                     alignItems: "center",
                     marginBottom: 14
@@ -322,14 +473,14 @@
                 onPress: () => setAsSelf(!asSelf)
             },
                 React.createElement(Text, {
-                    style: { color: "#ffffff", fontWeight: "bold", fontSize: 14 }
-                }, asSelf ? `👤 Sending as: ${myName} (You)` : `🎭 Sending as: ${otherName}`)
+                    style: { color: "#ffffff", fontWeight: "bold", fontSize: 15 }
+                }, asSelf ? `👤 Talking as: ${myName} (You)` : `🎭 Talking as: ${otherName}`)
             ),
 
             // Message Input
             React.createElement(Text, {
                 style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold", marginBottom: 6 }
-            }, "MESSAGE TEXT (@mentions & links supported)"),
+            }, "MESSAGE CONTENT (@mentions and links work)"),
             React.createElement(TextInput, {
                 style: {
                     backgroundColor: "#2b2d31",
@@ -341,7 +492,7 @@
                     textAlignVertical: "top",
                     marginBottom: 14
                 },
-                placeholder: "Type fake message here...",
+                placeholder: `Type what ${asSelf ? "you" : otherName} will say...`,
                 placeholderTextColor: "#6d6f78",
                 multiline: true,
                 value: messageText,
@@ -351,7 +502,7 @@
             // File Attachment Input
             React.createElement(Text, {
                 style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold", marginBottom: 6 }
-            }, "FILE ATTACHMENT (.exe, .zip, .pdf, images, etc.)"),
+            }, "OPTIONAL ATTACHMENT (.exe, .zip, .pdf, images)"),
             React.createElement(TextInput, {
                 style: {
                     backgroundColor: "#2b2d31",
@@ -361,7 +512,7 @@
                     fontSize: 14,
                     marginBottom: 16
                 },
-                placeholder: "e.g. payload.exe, classified.zip (optional)",
+                placeholder: "e.g. payload.exe, confidential.zip",
                 placeholderTextColor: "#6d6f78",
                 value: fileName,
                 onChangeText: setFileName
@@ -386,7 +537,7 @@
             // Quick hint
             React.createElement(Text, {
                 style: { color: "#6d6f78", fontSize: 11, textAlign: "center" }
-            }, "Client-side only. You can also type !fake <text> directly in chat!")
+            }, "Purely client-side prop. Nothing is ever sent to Discord servers.")
         );
     }
 
@@ -409,9 +560,7 @@
             initModules();
             unpatches = [];
 
-            // ════════════════════════════════════════════════════════════════════
             // 1. Hook the + Button and Chat Action Sheets to add "⚡ Fake DM"
-            // ════════════════════════════════════════════════════════════════════
             if (LazyActionSheet?.openLazy && patcher.before) {
                 try {
                     const unpatchSheet = patcher.before("openLazy", LazyActionSheet, (args) => {
@@ -460,15 +609,10 @@
                         });
                     });
                     unpatches.push(unpatchSheet);
-                    console.log("[FakeDMs] ActionSheet patch registered!");
-                } catch (e) {
-                    console.error("[FakeDMs] ActionSheet patch error:", e);
-                }
+                } catch (e) {}
             }
 
-            // ════════════════════════════════════════════════════════════════════
             // 2. Chat Prefix: !fake <message> [--file name.exe] [--me]
-            // ════════════════════════════════════════════════════════════════════
             if (MessageActions?.sendMessage && patcher.instead) {
                 try {
                     const unpatchSend = patcher.instead("sendMessage", MessageActions, (args, orig) => {
@@ -512,15 +656,10 @@
                         return orig(...args);
                     });
                     unpatches.push(unpatchSend);
-                    console.log("[FakeDMs] Chat interceptor active!");
-                } catch (e) {
-                    console.error("[FakeDMs] sendMessage patch error:", e);
-                }
+                } catch (e) {}
             }
 
-            // ════════════════════════════════════════════════════════════════════
-            // 3. Slash Command: /fakedm with complete required descriptors
-            // ════════════════════════════════════════════════════════════════════
+            // 3. Slash Command: /fakedm
             const register = commands.registerCommand || mod.commands?.registerCommand;
             if (typeof register === "function") {
                 try {
@@ -585,7 +724,7 @@
                 } catch (e) {}
             }
 
-            notify("✨ FakeDMs v3.4 ready! Tap + in chat or use Settings ⚙️");
+            notify("✨ FakeDMs v3.5 loaded! Pick any DM inside settings ⚙️");
         },
         onUnload: () => {
             unpatches.forEach((u) => {
