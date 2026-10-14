@@ -6,7 +6,9 @@
     const mod = root.kettu || root.bunny || root.vendetta;
 
     const metro = mod?.metro;
+    const patcher = mod?.patcher;
     const commands = mod?.commands;
+    const toasts = mod?.ui?.toasts;
 
     const findByProps = (...props) => metro?.findByProps(...props);
 
@@ -16,6 +18,7 @@
     let SelectedChannelStore;
     let ChannelStore;
     let RelationshipStore;
+    let MessageActions;
 
     function initModules() {
         try {
@@ -24,9 +27,20 @@
             SelectedChannelStore = findByProps("getChannelId");
             ChannelStore = findByProps("getChannel");
             RelationshipStore = findByProps("getRelationships", "getFriendIDs");
+            MessageActions = findByProps("sendMessage", "receiveMessage") || findByProps("sendMessage");
         } catch (e) {
             console.error("[FakeDMs] Error resolving Metro modules:", e);
         }
+    }
+
+    function notify(text) {
+        try {
+            if (toasts?.showToast) {
+                toasts.showToast(text, "ic_message_edit");
+            } else {
+                console.log("[FakeDMs]", text);
+            }
+        } catch {}
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -135,147 +149,221 @@
         return { parsedText, mentions, mentionEveryone };
     }
 
-    let unregister;
+    // ── Core Injection Engine ────────────────────────────────────────────────
+    function injectFakeMessage({ text, fileName, fileUrl, asSelf, channelId }) {
+        initModules();
+
+        const targetChannelId = channelId || SelectedChannelStore?.getChannelId();
+        const channel = ChannelStore?.getChannel(targetChannelId);
+
+        if (!channel || (channel.type !== 1 && channel.type !== 3)) {
+            notify("⚠️ Only works inside DMs or Group chats!");
+            return;
+        }
+
+        const currentUser = UserStore?.getCurrentUser();
+        let sender = currentUser;
+
+        if (!asSelf) {
+            const recipientId = channel.recipients?.find((id) => id !== currentUser.id);
+            if (recipientId && UserStore) {
+                sender = UserStore.getUser(recipientId) || currentUser;
+            }
+        }
+
+        const { parsedText, mentions, mentionEveryone } = parseMentions(text || "", channel);
+
+        const attachments = [];
+        if (fileName) {
+            const attachId = generateSnowflake();
+            const dlUrl = fileUrl || `https://cdn.discordapp.com/attachments/0/${attachId}/${encodeURIComponent(fileName)}`;
+            attachments.push({
+                id: attachId,
+                filename: fileName,
+                size: getRandomFileSize(fileName),
+                url: dlUrl,
+                proxy_url: dlUrl,
+                content_type: guessContentType(fileName),
+                spoiler: false
+            });
+        }
+
+        const messageId = generateSnowflake();
+
+        if (!FluxDispatcher?.dispatch) {
+            notify("⚠️ FluxDispatcher not available.");
+            return;
+        }
+
+        FluxDispatcher.dispatch({
+            type: "MESSAGE_CREATE",
+            channelId: targetChannelId,
+            message: {
+                id: messageId,
+                type: 0,
+                channel_id: targetChannelId,
+                author: {
+                    id: sender.id,
+                    username: sender.username,
+                    global_name: sender.globalName || sender.username,
+                    avatar: sender.avatar,
+                    discriminator: sender.discriminator || "0",
+                    public_flags: sender.publicFlags || 0,
+                    bot: false
+                },
+                content: parsedText,
+                timestamp: new Date().toISOString(),
+                edited_timestamp: null,
+                tts: false,
+                mention_everyone: mentionEveryone,
+                mentions: mentions,
+                mention_roles: [],
+                attachments: attachments,
+                embeds: [],
+                reactions: [],
+                pinned: false,
+                flags: 0
+            },
+            optimistic: false,
+            isPushNotification: false
+        });
+
+        notify(`✨ Injected as ${sender.globalName || sender.username}!`);
+    }
+
+    let unpatches = [];
 
     const plugin = {
         onLoad: () => {
             initModules();
+            unpatches = [];
 
-            const register = commands?.registerCommand || mod?.commands?.registerCommand;
-            if (typeof register !== "function") {
-                console.error("[FakeDMs] registerCommand is not available in Kettu");
-                return;
+            // ════════════════════════════════════════════════════════════════════
+            // METHOD 1: Chat Prefix Trigger (!fake <message> [--file name.exe] [--me])
+            // Just type it in the text box and hit send!
+            // It will NEVER send to Discord servers — intercepts locally!
+            // ════════════════════════════════════════════════════════════════════
+            if (MessageActions?.sendMessage && patcher?.instead) {
+                try {
+                    const unpatchSend = patcher.instead("sendMessage", MessageActions, (args, orig) => {
+                        const [channelId, msgObj] = args;
+                        const content = msgObj?.content ? msgObj.content.trim() : "";
+
+                        if (content.startsWith("!fake ") || content.startsWith("!fakedm ")) {
+                            let raw = content.replace(/^!(fakedm|fake)\s+/, "");
+
+                            let asSelf = false;
+                            if (raw.includes("--me")) {
+                                asSelf = true;
+                                raw = raw.replace("--me", "").trim();
+                            }
+
+                            let fileName = null;
+                            const fileMatch = raw.match(/--file\s+([^\s]+)/i);
+                            if (fileMatch) {
+                                fileName = fileMatch[1];
+                                raw = raw.replace(fileMatch[0], "").trim();
+                            }
+
+                            let fileUrl = null;
+                            const urlMatch = raw.match(/--url\s+([^\s]+)/i);
+                            if (urlMatch) {
+                                fileUrl = urlMatch[1];
+                                raw = raw.replace(urlMatch[0], "").trim();
+                            }
+
+                            injectFakeMessage({
+                                text: raw,
+                                fileName: fileName,
+                                fileUrl: fileUrl,
+                                asSelf: asSelf,
+                                channelId: channelId
+                            });
+
+                            // Cancel sending over network
+                            return Promise.resolve();
+                        }
+
+                        return orig(...args);
+                    });
+                    unpatches.push(unpatchSend);
+                    console.log("[FakeDMs] !fake chat prefix interceptor active!");
+                } catch (e) {
+                    console.error("[FakeDMs] Error patching sendMessage:", e);
+                }
             }
 
-            try {
-                unregister = register({
-                    name: "fakedm",
-                    displayName: "fakedm",
-                    description: "Inject client-sided DM messages with real profiles, @mentions, & attachments",
-                    type: 1, // CHAT_INPUT slash command
-                    inputType: 0, // BUILT_IN client command
-                    applicationId: "-1",
-                    options: [
-                        {
-                            name: "message",
-                            displayName: "message",
-                            description: "Message text (@mentions and links work)",
-                            type: 3, // STRING
-                            required: true
-                        },
-                        {
-                            name: "file",
-                            displayName: "file",
-                            description: "Attachment filename with extension (e.g. payload.exe, archive.zip)",
-                            type: 3, // STRING
-                            required: false
-                        },
-                        {
-                            name: "url",
-                            displayName: "url",
-                            description: "Optional custom download URL for the file",
-                            type: 3, // STRING
-                            required: false
-                        },
-                        {
-                            name: "as_self",
-                            displayName: "as_self",
-                            description: "Send as yourself instead of the other person? (true/false)",
-                            type: 5, // BOOLEAN
-                            required: false
-                        }
-                    ],
-                    execute: (args, ctx) => {
-                        initModules();
-
-                        const channelId = ctx?.channel?.id || SelectedChannelStore?.getChannelId();
-                        const channel = ctx?.channel || ChannelStore?.getChannel(channelId);
-
-                        if (!channel || (channel.type !== 1 && channel.type !== 3)) {
-                            return { content: "⚠️ Please run this command inside a DM or Group DM." };
-                        }
-
-                        const currentUser = UserStore?.getCurrentUser();
-                        let sender = currentUser;
-
-                        const asSelf = args.find((a) => a.name === "as_self")?.value || false;
-                        if (!asSelf) {
-                            const recipientId = channel.recipients?.find((id) => id !== currentUser.id);
-                            if (recipientId && UserStore) {
-                                sender = UserStore.getUser(recipientId) || currentUser;
+            // ════════════════════════════════════════════════════════════════════
+            // METHOD 2: Slash Command (/fakedm) fallback
+            // ════════════════════════════════════════════════════════════════════
+            const register = commands?.registerCommand || mod?.commands?.registerCommand;
+            if (typeof register === "function") {
+                try {
+                    const unregisterCmd = register({
+                        name: "fakedm",
+                        displayName: "fakedm",
+                        description: "Inject client-sided DM messages with real profiles, @mentions, & attachments",
+                        type: 1,
+                        inputType: 0,
+                        applicationId: "-1",
+                        options: [
+                            {
+                                name: "message",
+                                displayName: "message",
+                                description: "Message text (@mentions and links work)",
+                                type: 3,
+                                required: true
+                            },
+                            {
+                                name: "file",
+                                displayName: "file",
+                                description: "Attachment filename with extension (e.g. payload.exe, archive.zip)",
+                                type: 3,
+                                required: false
+                            },
+                            {
+                                name: "url",
+                                displayName: "url",
+                                description: "Optional custom download URL for the file",
+                                type: 3,
+                                required: false
+                            },
+                            {
+                                name: "as_self",
+                                displayName: "as_self",
+                                description: "Send as yourself instead of the other person? (true/false)",
+                                type: 5,
+                                required: false
                             }
-                        }
+                        ],
+                        execute: (args, ctx) => {
+                            const rawText = args.find((a) => a.name === "message")?.value || "";
+                            const fileName = args.find((a) => a.name === "file")?.value;
+                            const fileUrl = args.find((a) => a.name === "url")?.value;
+                            const asSelf = args.find((a) => a.name === "as_self")?.value || false;
 
-                        const rawText = args.find((a) => a.name === "message")?.value || "";
-                        const fileName = args.find((a) => a.name === "file")?.value;
-                        const fileUrl = args.find((a) => a.name === "url")?.value;
-
-                        const { parsedText, mentions, mentionEveryone } = parseMentions(rawText, channel);
-
-                        const attachments = [];
-                        if (fileName) {
-                            const attachId = generateSnowflake();
-                            const dlUrl = fileUrl || `https://cdn.discordapp.com/attachments/0/${attachId}/${encodeURIComponent(fileName)}`;
-                            attachments.push({
-                                id: attachId,
-                                filename: fileName,
-                                size: getRandomFileSize(fileName),
-                                url: dlUrl,
-                                proxy_url: dlUrl,
-                                content_type: guessContentType(fileName),
-                                spoiler: false
+                            injectFakeMessage({
+                                text: rawText,
+                                fileName,
+                                fileUrl,
+                                asSelf,
+                                channelId: ctx?.channel?.id
                             });
                         }
-
-                        const messageId = generateSnowflake();
-
-                        if (!FluxDispatcher?.dispatch) {
-                            return { content: "⚠️ FluxDispatcher not found in Kettu client." };
-                        }
-
-                        FluxDispatcher.dispatch({
-                            type: "MESSAGE_CREATE",
-                            channelId: channelId,
-                            message: {
-                                id: messageId,
-                                type: 0,
-                                channel_id: channelId,
-                                author: {
-                                    id: sender.id,
-                                    username: sender.username,
-                                    global_name: sender.globalName || sender.username,
-                                    avatar: sender.avatar,
-                                    discriminator: sender.discriminator || "0",
-                                    public_flags: sender.publicFlags || 0,
-                                    bot: false
-                                },
-                                content: parsedText,
-                                timestamp: new Date().toISOString(),
-                                edited_timestamp: null,
-                                tts: false,
-                                mention_everyone: mentionEveryone,
-                                mentions: mentions,
-                                mention_roles: [],
-                                attachments: attachments,
-                                embeds: [],
-                                reactions: [],
-                                pinned: false,
-                                flags: 0
-                            },
-                            optimistic: false,
-                            isPushNotification: false
-                        });
-                    }
-                });
-                console.log("[FakeDMs] /fakedm registered successfully!");
-            } catch (err) {
-                console.error("[FakeDMs] Failed to register command:", err);
+                    });
+                    if (typeof unregisterCmd === "function") unpatches.push(unregisterCmd);
+                } catch (e) {}
             }
+
+            notify("FakeDMs v3.3 loaded! Use !fake in chat");
         },
         onUnload: () => {
-            if (typeof unregister === "function") {
-                unregister();
-            }
+            unpatches.forEach((u) => {
+                try {
+                    if (typeof u === "function") u();
+                } catch {}
+            });
+            unpatches = [];
         }
     };
 
