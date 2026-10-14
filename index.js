@@ -3,14 +3,32 @@
 
     // ── Safe API Resolver across Kettu, Bunny, and Vendetta ───────────────────
     const root = typeof window !== "undefined" ? window : (typeof globalThis !== "undefined" ? globalThis : global);
-    const mod = root.kettu || root.bunny || root.vendetta;
+    const mod = root.kettu || root.bunny || root.vendetta || {};
 
-    const metro = mod?.metro;
-    const patcher = mod?.patcher;
-    const commands = mod?.commands;
-    const toasts = mod?.ui?.toasts;
+    const metro = mod.metro || {};
+    const patcher = mod.patcher || {};
+    const commands = mod.commands || {};
+    const toasts = mod.ui?.toasts || {};
+    const utils = mod.utils || {};
 
-    const findByProps = (...props) => metro?.findByProps(...props);
+    const findByProps = (...props) => metro.findByProps ? metro.findByProps(...props) : null;
+    const findInReactTree = utils.findInReactTree || ((tree, filter) => {
+        const stack = [tree];
+        while (stack.length > 0) {
+            const current = stack.pop();
+            if (!current) continue;
+            try {
+                if (filter(current)) return current;
+            } catch {}
+            if (Array.isArray(current)) {
+                for (const item of current) stack.push(item);
+            } else if (typeof current === "object") {
+                if (current.props) stack.push(current.props);
+                if (current.children) stack.push(current.children);
+            }
+        }
+        return null;
+    });
 
     // ── Metro Modules ────────────────────────────────────────────────────────
     let FluxDispatcher;
@@ -18,16 +36,24 @@
     let SelectedChannelStore;
     let ChannelStore;
     let RelationshipStore;
+    let LazyActionSheet;
     let MessageActions;
+    let React;
+    let ReactNative;
 
     function initModules() {
         try {
-            FluxDispatcher = findByProps("dispatch", "subscribe");
+            FluxDispatcher = findByProps("_currentDispatchActionType") || findByProps("dispatch", "subscribe");
             UserStore = findByProps("getCurrentUser", "getUser");
             SelectedChannelStore = findByProps("getChannelId");
             ChannelStore = findByProps("getChannel");
             RelationshipStore = findByProps("getRelationships", "getFriendIDs");
+            LazyActionSheet = findByProps("openLazy", "hideActionSheet");
             MessageActions = findByProps("sendMessage", "receiveMessage") || findByProps("sendMessage");
+
+            const common = metro.common || {};
+            React = common.React || root.React;
+            ReactNative = common.ReactNative || root.ReactNative || findByProps("View", "Text");
         } catch (e) {
             console.error("[FakeDMs] Error resolving Metro modules:", e);
         }
@@ -35,7 +61,7 @@
 
     function notify(text) {
         try {
-            if (toasts?.showToast) {
+            if (toasts.showToast) {
                 toasts.showToast(text, "ic_message_edit");
             } else {
                 console.log("[FakeDMs]", text);
@@ -157,8 +183,8 @@
         const channel = ChannelStore?.getChannel(targetChannelId);
 
         if (!channel || (channel.type !== 1 && channel.type !== 3)) {
-            notify("⚠️ Only works inside DMs or Group chats!");
-            return;
+            notify("⚠️ Please open a DM or Group DM first!");
+            return false;
         }
 
         const currentUser = UserStore?.getCurrentUser();
@@ -192,7 +218,7 @@
 
         if (!FluxDispatcher?.dispatch) {
             notify("⚠️ FluxDispatcher not available.");
-            return;
+            return false;
         }
 
         FluxDispatcher.dispatch({
@@ -229,6 +255,151 @@
         });
 
         notify(`✨ Injected as ${sender.globalName || sender.username}!`);
+        return true;
+    }
+
+    // ── React Native Composer Component ───────────────────────────────────────
+    function ComposerView({ onClose }) {
+        initModules();
+        if (!React || !ReactNative) return null;
+
+        const { View, Text, TextInput, TouchableOpacity, ScrollView } = ReactNative;
+        const [messageText, setMessageText] = React.useState("");
+        const [fileName, setFileName] = React.useState("");
+        const [asSelf, setAsSelf] = React.useState(false);
+
+        const currentChannelId = SelectedChannelStore?.getChannelId();
+        const channel = ChannelStore?.getChannel(currentChannelId);
+        const currentUser = UserStore?.getCurrentUser();
+        const otherUserId = channel?.recipients?.find((id) => id !== currentUser?.id);
+        const otherUser = otherUserId ? UserStore?.getUser(otherUserId) : null;
+
+        const otherName = otherUser?.globalName || otherUser?.username || "Them";
+        const myName = currentUser?.globalName || currentUser?.username || "You";
+
+        const handleInject = () => {
+            if (!messageText.trim() && !fileName.trim()) {
+                notify("⚠️ Enter a message or filename!");
+                return;
+            }
+
+            const success = injectFakeMessage({
+                text: messageText,
+                fileName: fileName.trim() || null,
+                asSelf: asSelf,
+                channelId: currentChannelId
+            });
+
+            if (success) {
+                setMessageText("");
+                setFileName("");
+                if (typeof onClose === "function") onClose();
+                if (LazyActionSheet?.hideActionSheet) LazyActionSheet.hideActionSheet();
+            }
+        };
+
+        return React.createElement(ScrollView, {
+            style: { padding: 16, backgroundColor: "#1e1f22", borderRadius: 12 },
+            contentContainerStyle: { paddingBottom: 32 }
+        },
+            // Title Header
+            React.createElement(Text, {
+                style: { color: "#ffffff", fontSize: 18, fontWeight: "bold", marginBottom: 4 }
+            }, "⚡ Fake DM Composer"),
+            React.createElement(Text, {
+                style: { color: "#949ba4", fontSize: 12, marginBottom: 16 }
+            }, channel ? `Target: #${channel.name || otherName}` : "Open a DM to target"),
+
+            // Sender Switch Button
+            React.createElement(TouchableOpacity, {
+                style: {
+                    backgroundColor: asSelf ? "#248046" : "#5865F2",
+                    padding: 12,
+                    borderRadius: 8,
+                    alignItems: "center",
+                    marginBottom: 14
+                },
+                onPress: () => setAsSelf(!asSelf)
+            },
+                React.createElement(Text, {
+                    style: { color: "#ffffff", fontWeight: "bold", fontSize: 14 }
+                }, asSelf ? `👤 Sending as: ${myName} (You)` : `🎭 Sending as: ${otherName}`)
+            ),
+
+            // Message Input
+            React.createElement(Text, {
+                style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold", marginBottom: 6 }
+            }, "MESSAGE TEXT (@mentions & links supported)"),
+            React.createElement(TextInput, {
+                style: {
+                    backgroundColor: "#2b2d31",
+                    color: "#ffffff",
+                    borderRadius: 8,
+                    padding: 12,
+                    fontSize: 14,
+                    minHeight: 70,
+                    textAlignVertical: "top",
+                    marginBottom: 14
+                },
+                placeholder: "Type fake message here...",
+                placeholderTextColor: "#6d6f78",
+                multiline: true,
+                value: messageText,
+                onChangeText: setMessageText
+            }),
+
+            // File Attachment Input
+            React.createElement(Text, {
+                style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold", marginBottom: 6 }
+            }, "FILE ATTACHMENT (.exe, .zip, .pdf, images, etc.)"),
+            React.createElement(TextInput, {
+                style: {
+                    backgroundColor: "#2b2d31",
+                    color: "#ffffff",
+                    borderRadius: 8,
+                    padding: 12,
+                    fontSize: 14,
+                    marginBottom: 16
+                },
+                placeholder: "e.g. payload.exe, classified.zip (optional)",
+                placeholderTextColor: "#6d6f78",
+                value: fileName,
+                onChangeText: setFileName
+            }),
+
+            // Inject Button
+            React.createElement(TouchableOpacity, {
+                style: {
+                    backgroundColor: "#5865F2",
+                    padding: 14,
+                    borderRadius: 8,
+                    alignItems: "center",
+                    marginBottom: 10
+                },
+                onPress: handleInject
+            },
+                React.createElement(Text, {
+                    style: { color: "#ffffff", fontWeight: "bold", fontSize: 16 }
+                }, "⚡ Inject Message Locally")
+            ),
+
+            // Quick hint
+            React.createElement(Text, {
+                style: { color: "#6d6f78", fontSize: 11, textAlign: "center" }
+            }, "Client-side only. You can also type !fake <text> directly in chat!")
+        );
+    }
+
+    function openComposer() {
+        initModules();
+        if (LazyActionSheet?.openLazy) {
+            LazyActionSheet.openLazy(
+                Promise.resolve({ default: () => React.createElement(ComposerView, { onClose: () => LazyActionSheet.hideActionSheet() }) }),
+                "FakeDMComposer"
+            );
+        } else {
+            notify("⚠️ Could not open composer sheet.");
+        }
     }
 
     let unpatches = [];
@@ -239,11 +410,66 @@
             unpatches = [];
 
             // ════════════════════════════════════════════════════════════════════
-            // METHOD 1: Chat Prefix Trigger (!fake <message> [--file name.exe] [--me])
-            // Just type it in the text box and hit send!
-            // It will NEVER send to Discord servers — intercepts locally!
+            // 1. Hook the + Button and Chat Action Sheets to add "⚡ Fake DM"
             // ════════════════════════════════════════════════════════════════════
-            if (MessageActions?.sendMessage && patcher?.instead) {
+            if (LazyActionSheet?.openLazy && patcher.before) {
+                try {
+                    const unpatchSheet = patcher.before("openLazy", LazyActionSheet, (args) => {
+                        const [component] = args;
+                        if (!component || typeof component.then !== "function") return;
+
+                        component.then((instance) => {
+                            if (!instance || !instance.default || !patcher.after) return;
+                            const unpatchRender = patcher.after("default", instance, (_, res) => {
+                                try {
+                                    if (!React || !ReactNative) return;
+                                    const { TouchableOpacity, Text } = ReactNative;
+
+                                    const targetList = findInReactTree(res, (x) =>
+                                        Array.isArray(x) && x.some((item) =>
+                                            item?.props?.label || item?.props?.title || item?.type?.name === "ButtonRow" || item?.props?.leading
+                                        )
+                                    );
+
+                                    if (targetList && !targetList.some((item) => item?.key === "fakedm-action-btn")) {
+                                        targetList.unshift(
+                                            React.createElement(TouchableOpacity, {
+                                                key: "fakedm-action-btn",
+                                                style: {
+                                                    flexDirection: "row",
+                                                    alignItems: "center",
+                                                    padding: 14,
+                                                    backgroundColor: "#2b2d31",
+                                                    borderRadius: 8,
+                                                    marginVertical: 4
+                                                },
+                                                onPress: () => {
+                                                    LazyActionSheet.hideActionSheet();
+                                                    setTimeout(() => openComposer(), 250);
+                                                }
+                                            },
+                                                React.createElement(Text, {
+                                                    style: { color: "#5865F2", fontWeight: "bold", fontSize: 15 }
+                                                }, "⚡ Fake DM Composer")
+                                            )
+                                        );
+                                    }
+                                } catch {}
+                            });
+                            unpatches.push(unpatchRender);
+                        });
+                    });
+                    unpatches.push(unpatchSheet);
+                    console.log("[FakeDMs] ActionSheet patch registered!");
+                } catch (e) {
+                    console.error("[FakeDMs] ActionSheet patch error:", e);
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════════
+            // 2. Chat Prefix: !fake <message> [--file name.exe] [--me]
+            // ════════════════════════════════════════════════════════════════════
+            if (MessageActions?.sendMessage && patcher.instead) {
                 try {
                     const unpatchSend = patcher.instead("sendMessage", MessageActions, (args, orig) => {
                         const [channelId, msgObj] = args;
@@ -280,29 +506,29 @@
                                 channelId: channelId
                             });
 
-                            // Cancel sending over network
                             return Promise.resolve();
                         }
 
                         return orig(...args);
                     });
                     unpatches.push(unpatchSend);
-                    console.log("[FakeDMs] !fake chat prefix interceptor active!");
+                    console.log("[FakeDMs] Chat interceptor active!");
                 } catch (e) {
-                    console.error("[FakeDMs] Error patching sendMessage:", e);
+                    console.error("[FakeDMs] sendMessage patch error:", e);
                 }
             }
 
             // ════════════════════════════════════════════════════════════════════
-            // METHOD 2: Slash Command (/fakedm) fallback
+            // 3. Slash Command: /fakedm with complete required descriptors
             // ════════════════════════════════════════════════════════════════════
-            const register = commands?.registerCommand || mod?.commands?.registerCommand;
+            const register = commands.registerCommand || mod.commands?.registerCommand;
             if (typeof register === "function") {
                 try {
                     const unregisterCmd = register({
                         name: "fakedm",
                         displayName: "fakedm",
                         description: "Inject client-sided DM messages with real profiles, @mentions, & attachments",
+                        displayDescription: "Inject client-sided DM messages with real profiles, @mentions, & attachments",
                         type: 1,
                         inputType: 0,
                         applicationId: "-1",
@@ -311,6 +537,7 @@
                                 name: "message",
                                 displayName: "message",
                                 description: "Message text (@mentions and links work)",
+                                displayDescription: "Message text (@mentions and links work)",
                                 type: 3,
                                 required: true
                             },
@@ -318,6 +545,7 @@
                                 name: "file",
                                 displayName: "file",
                                 description: "Attachment filename with extension (e.g. payload.exe, archive.zip)",
+                                displayDescription: "Attachment filename with extension (e.g. payload.exe, archive.zip)",
                                 type: 3,
                                 required: false
                             },
@@ -325,6 +553,7 @@
                                 name: "url",
                                 displayName: "url",
                                 description: "Optional custom download URL for the file",
+                                displayDescription: "Optional custom download URL for the file",
                                 type: 3,
                                 required: false
                             },
@@ -332,6 +561,7 @@
                                 name: "as_self",
                                 displayName: "as_self",
                                 description: "Send as yourself instead of the other person? (true/false)",
+                                displayDescription: "Send as yourself instead of the other person? (true/false)",
                                 type: 5,
                                 required: false
                             }
@@ -355,7 +585,7 @@
                 } catch (e) {}
             }
 
-            notify("FakeDMs v3.3 loaded! Use !fake in chat");
+            notify("✨ FakeDMs v3.4 ready! Tap + in chat or use Settings ⚙️");
         },
         onUnload: () => {
             unpatches.forEach((u) => {
@@ -364,7 +594,9 @@
                 } catch {}
             });
             unpatches = [];
-        }
+        },
+        // Settings page renderer (gear icon in Plugins list)
+        settings: ComposerView
     };
 
     return plugin;
