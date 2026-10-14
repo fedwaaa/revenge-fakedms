@@ -30,8 +30,155 @@
         return null;
     });
 
-    // ── Memory Store for Injected Messages (Channel Persistence) ──────────────
+    // ── Persistent Storage for Injected Messages (Survives App Restarts) ─────
     const fakeMessagesByChannel = new Map();
+    const STORAGE_KEY = "FAKEDMS_MESSAGES_STORE_V1";
+    let cachedAsyncStorage = null;
+
+    function getAsyncStorage() {
+        if (cachedAsyncStorage) return cachedAsyncStorage;
+        try {
+            const modAsync = metro.common?.AsyncStorage;
+            if (modAsync && typeof modAsync.getItem === "function") {
+                cachedAsyncStorage = modAsync;
+                return cachedAsyncStorage;
+            }
+            const found = findByProps("getItem", "setItem");
+            if (found && typeof found.getItem === "function") {
+                cachedAsyncStorage = found;
+                return cachedAsyncStorage;
+            }
+        } catch {}
+        return null;
+    }
+
+    async function savePersistentStore() {
+        try {
+            const data = {};
+            for (const [chId, msgs] of fakeMessagesByChannel.entries()) {
+                if (Array.isArray(msgs) && msgs.length > 0) {
+                    data[chId] = msgs;
+                }
+            }
+            const json = JSON.stringify(data);
+
+            // 1. AsyncStorage (Discord React Native)
+            try {
+                const storage = getAsyncStorage();
+                if (storage && typeof storage.setItem === "function") {
+                    await storage.setItem(STORAGE_KEY, json);
+                }
+            } catch {}
+
+            // 2. Kettu / Bunny / Vendetta storage
+            try {
+                if (mod.storage && typeof mod.storage === "object") {
+                    mod.storage[STORAGE_KEY] = json;
+                }
+            } catch {}
+
+            // 3. localStorage (Hermes/JSC global runtime)
+            try {
+                if (typeof localStorage !== "undefined" && localStorage && typeof localStorage.setItem === "function") {
+                    localStorage.setItem(STORAGE_KEY, json);
+                }
+            } catch {}
+        } catch (e) {
+            console.error("[FakeDMs] Error saving persistent messages:", e);
+        }
+    }
+
+    async function loadPersistentStore() {
+        try {
+            let json = null;
+
+            // 1. AsyncStorage
+            try {
+                const storage = getAsyncStorage();
+                if (storage && typeof storage.getItem === "function") {
+                    json = await storage.getItem(STORAGE_KEY);
+                }
+            } catch {}
+
+            // 2. Mod storage
+            if (!json) {
+                try {
+                    if (mod.storage && mod.storage[STORAGE_KEY]) {
+                        json = mod.storage[STORAGE_KEY];
+                    }
+                } catch {}
+            }
+
+            // 3. localStorage
+            if (!json) {
+                try {
+                    if (typeof localStorage !== "undefined" && localStorage && typeof localStorage.getItem === "function") {
+                        json = localStorage.getItem(STORAGE_KEY);
+                    }
+                } catch {}
+            }
+
+            if (json) {
+                const parsed = typeof json === "string" ? JSON.parse(json) : json;
+                if (parsed && typeof parsed === "object") {
+                    fakeMessagesByChannel.clear();
+                    for (const [chId, msgs] of Object.entries(parsed)) {
+                        if (Array.isArray(msgs) && msgs.length > 0) {
+                            fakeMessagesByChannel.set(chId, msgs);
+                        }
+                    }
+                    console.log("[FakeDMs] Loaded persistent messages for channels:", Object.keys(parsed).length);
+                }
+            }
+        } catch (e) {
+            console.error("[FakeDMs] Error loading persistent messages:", e);
+        }
+    }
+
+    function deleteFakeMessages(channelId) {
+        if (!channelId || !fakeMessagesByChannel.has(channelId)) return;
+        const msgs = fakeMessagesByChannel.get(channelId) || [];
+
+        // Erase each fake message live from Discord chat view
+        if (FluxDispatcher?.dispatch) {
+            for (const msg of msgs) {
+                try {
+                    FluxDispatcher.dispatch({
+                        type: "MESSAGE_DELETE",
+                        channelId: channelId,
+                        id: msg.id
+                    });
+                } catch {}
+            }
+        }
+
+        fakeMessagesByChannel.delete(channelId);
+        savePersistentStore();
+    }
+
+    function deleteSingleFakeMessage(channelId, messageId) {
+        if (!channelId || !messageId || !fakeMessagesByChannel.has(channelId)) return;
+        const msgs = fakeMessagesByChannel.get(channelId) || [];
+        const remaining = msgs.filter((m) => m.id !== messageId);
+
+        if (remaining.length > 0) {
+            fakeMessagesByChannel.set(channelId, remaining);
+        } else {
+            fakeMessagesByChannel.delete(channelId);
+        }
+
+        if (FluxDispatcher?.dispatch) {
+            try {
+                FluxDispatcher.dispatch({
+                    type: "MESSAGE_DELETE",
+                    channelId: channelId,
+                    id: messageId
+                });
+            } catch {}
+        }
+
+        savePersistentStore();
+    }
 
     // ── Metro Modules ────────────────────────────────────────────────────────
     let FluxDispatcher;
@@ -329,11 +476,12 @@
             flags: 0
         };
 
-        // Save to persistent channel list
+        // Save to persistent channel list & write to storage
         if (!fakeMessagesByChannel.has(targetChannelId)) {
             fakeMessagesByChannel.set(targetChannelId, []);
         }
         fakeMessagesByChannel.get(targetChannelId).push(message);
+        savePersistentStore();
 
         // Dispatch into local view immediately
         FluxDispatcher.dispatch({
@@ -374,9 +522,11 @@
         const otherName = otherUser?.globalName || otherUser?.username || selectedChannel?.name || "Target User";
         const myName = currentUser?.globalName || currentUser?.username || "You";
 
-        const injectedCount = targetChannelId && fakeMessagesByChannel.has(targetChannelId)
-            ? fakeMessagesByChannel.get(targetChannelId).length
-            : 0;
+        const [updateTick, setUpdateTick] = React.useState(0);
+        const triggerUpdate = () => setUpdateTick((t) => t + 1);
+
+        const currentFakes = (targetChannelId && fakeMessagesByChannel.get(targetChannelId)) || [];
+        const injectedCount = currentFakes.length;
 
         const handleInject = () => {
             if (!targetChannelId) {
@@ -398,6 +548,7 @@
             if (success) {
                 setMessageText("");
                 setFileName("");
+                triggerUpdate();
                 if (typeof onClose === "function") onClose();
                 if (LazyActionSheet?.hideActionSheet) LazyActionSheet.hideActionSheet();
             }
@@ -411,10 +562,19 @@
             }
         };
 
-        const handleClearFakes = () => {
+        const handleDeleteAllInDM = () => {
             if (targetChannelId && fakeMessagesByChannel.has(targetChannelId)) {
-                fakeMessagesByChannel.delete(targetChannelId);
-                notify(`🗑 Cleared fake messages for DM with ${otherName}`);
+                deleteFakeMessages(targetChannelId);
+                triggerUpdate();
+                notify(`🗑 Deleted all fake messages for DM with ${otherName}`);
+            }
+        };
+
+        const handleDeleteSingle = (msgId) => {
+            if (targetChannelId) {
+                deleteSingleFakeMessage(targetChannelId, msgId);
+                triggerUpdate();
+                notify("🗑 Deleted fake message");
             }
         };
 
@@ -509,8 +669,8 @@
                 React.createElement(TouchableOpacity, { onPress: handleJumpToDM },
                     React.createElement(Text, { style: { color: "#00aff4", fontSize: 12, fontWeight: "600" } }, `➔ Open DM with ${otherName}`)
                 ),
-                injectedCount > 0 ? React.createElement(TouchableOpacity, { onPress: handleClearFakes },
-                    React.createElement(Text, { style: { color: "#ed4245", fontSize: 12, fontWeight: "600" } }, `🗑 Clear (${injectedCount})`)
+                injectedCount > 0 ? React.createElement(TouchableOpacity, { onPress: handleDeleteAllInDM },
+                    React.createElement(Text, { style: { color: "#ed4245", fontSize: 12, fontWeight: "600" } }, `🗑 Delete All (${injectedCount})`)
                 ) : null
             ) : null,
 
@@ -587,10 +747,67 @@
                 }, "⚡ Inject Message Locally")
             ),
 
+            // Saved Messages List for this DM (with individual Delete buttons)
+            currentFakes.length > 0 ? React.createElement(View, {
+                style: { marginTop: 10, borderTopWidth: 1, borderTopColor: "#35373c", paddingTop: 12 }
+            },
+                React.createElement(View, {
+                    style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }
+                },
+                    React.createElement(Text, {
+                        style: { color: "#b5bac1", fontSize: 12, fontWeight: "bold" }
+                    }, `SAVED IN THIS DM (${currentFakes.length})`),
+                    React.createElement(TouchableOpacity, { onPress: handleDeleteAllInDM },
+                        React.createElement(Text, {
+                            style: { color: "#ed4245", fontSize: 12, fontWeight: "bold" }
+                        }, "🗑 Delete All")
+                    )
+                ),
+                currentFakes.map((msg) => {
+                    const isMsgSelf = msg.author?.id === currentUser?.id;
+                    const senderLabel = isMsgSelf ? `${myName} (You)` : (msg.author?.global_name || msg.author?.username || otherName);
+                    const previewText = msg.content || (msg.attachments?.[0]?.filename ? `📎 ${msg.attachments[0].filename}` : "Message");
+                    return React.createElement(View, {
+                        key: msg.id,
+                        style: {
+                            flexDirection: "row",
+                            alignItems: "center",
+                            backgroundColor: "#2b2d31",
+                            padding: 10,
+                            borderRadius: 8,
+                            marginBottom: 6
+                        }
+                    },
+                        React.createElement(View, { style: { flex: 1, marginRight: 8 } },
+                            React.createElement(Text, {
+                                style: { color: isMsgSelf ? "#57f287" : "#5865f2", fontSize: 12, fontWeight: "bold", marginBottom: 2 }
+                            }, senderLabel),
+                            React.createElement(Text, {
+                                style: { color: "#dbdee1", fontSize: 13 },
+                                numberOfLines: 2
+                            }, previewText)
+                        ),
+                        React.createElement(TouchableOpacity, {
+                            style: {
+                                backgroundColor: "#da373c",
+                                paddingVertical: 6,
+                                paddingHorizontal: 10,
+                                borderRadius: 6
+                            },
+                            onPress: () => handleDeleteSingle(msg.id)
+                        },
+                            React.createElement(Text, {
+                                style: { color: "#ffffff", fontSize: 12, fontWeight: "bold" }
+                            }, "Delete")
+                        )
+                    );
+                })
+            ) : null,
+
             // Quick hint
             React.createElement(Text, {
-                style: { color: "#6d6f78", fontSize: 11, textAlign: "center" }
-            }, "Messages stay saved in the DM automatically! Tap Clear to remove.")
+                style: { color: "#6d6f78", fontSize: 11, textAlign: "center", marginTop: 10 }
+            }, "Messages are permanently saved to your device until you press Delete. Loads silently in background.")
         );
     }
 
@@ -613,9 +830,16 @@
             initModules();
             unpatches = [];
 
-            // ════════════════════════════════════════════════════════════════════
-            // 0. Auto-Restore Injected Messages When Switching/Loading Channels
-            // ════════════════════════════════════════════════════════════════════
+            // 0. Silently load persistent messages from device storage in background
+            loadPersistentStore().then(() => {
+                const activeCh = SelectedChannelStore?.getChannelId();
+                if (activeCh && fakeMessagesByChannel.has(activeCh)) {
+                    setTimeout(() => restoreFakeMessages(activeCh), 200);
+                    setTimeout(() => restoreFakeMessages(activeCh), 800);
+                }
+            });
+
+            // 1. Auto-Restore Injected Messages When Switching/Loading Channels
             if (FluxDispatcher?.subscribe) {
                 try {
                     const handleFluxEvent = (event) => {
@@ -626,6 +850,7 @@
                             if (chId && fakeMessagesByChannel.has(chId)) {
                                 setTimeout(() => restoreFakeMessages(chId), 120);
                                 setTimeout(() => restoreFakeMessages(chId), 500);
+                                setTimeout(() => restoreFakeMessages(chId), 1200);
                             }
                         }
                     };
@@ -639,7 +864,6 @@
                             FluxDispatcher.unsubscribe("CHANNEL_SELECT", handleFluxEvent);
                         } catch {}
                     });
-                    console.log("[FakeDMs] Auto-restore listener active!");
                 } catch (e) {
                     console.error("[FakeDMs] Flux subscribe error:", e);
                 }
@@ -815,7 +1039,7 @@
                 } catch (e) {}
             }
 
-            notify("✨ FakeDMs v3.6 active! Messages persist across channel switches.");
+            // Loads 100% silently in background with no startup banner
         },
         onUnload: () => {
             unpatches.forEach((u) => {
