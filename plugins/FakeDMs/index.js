@@ -87,21 +87,81 @@
 
     // ── Persistent Storage for Injected Messages (Survives App Restarts) ─────
     const fakeMessagesByChannel = new Map();
-    const STORAGE_KEY = "FAKEDMS_MESSAGES_STORE_V1";
-    let cachedAsyncStorage = null;
+    const STORAGE_KEY = "FAKEDMS_MESSAGES_DATA_V3";
+    const FILE_NAME = "fakedms_messages.json";
+    let storageBackendUsed = "Initializing...";
 
-    function getAsyncStorage() {
-        if (cachedAsyncStorage) return cachedAsyncStorage;
+    function getFileManager() {
         try {
-            const modAsync = metro.common?.AsyncStorage;
-            if (modAsync && typeof modAsync.getItem === "function") {
-                cachedAsyncStorage = modAsync;
-                return cachedAsyncStorage;
+            const nmp = (typeof window !== "undefined" && window.nativeModuleProxy) || 
+                        (typeof globalThis !== "undefined" && globalThis.nativeModuleProxy) || 
+                        (typeof global !== "undefined" && global.nativeModuleProxy);
+            if (nmp) {
+                const fm = nmp.DCDFileManager || nmp.RTNFileManager || nmp.FileManager;
+                if (fm && (typeof fm.writeFile === "function" || typeof fm.writeSafely === "function")) {
+                    return fm;
+                }
             }
-            const found = findByProps("getItem", "setItem");
-            if (found && typeof found.getItem === "function") {
-                cachedAsyncStorage = found;
-                return cachedAsyncStorage;
+        } catch {}
+
+        try {
+            const rn = metro.common?.ReactNative || (typeof ReactNative !== "undefined" ? ReactNative : null);
+            const nm = rn?.NativeModules;
+            if (nm) {
+                const fm = nm.DCDFileManager || nm.RTNFileManager || nm.FileManager;
+                if (fm && (typeof fm.writeFile === "function" || typeof fm.writeSafely === "function")) {
+                    return fm;
+                }
+            }
+        } catch {}
+
+        try {
+            const fm = findByProps("writeFile", "readFile");
+            if (fm && (typeof fm.writeFile === "function" || typeof fm.writeSafely === "function")) {
+                return fm;
+            }
+        } catch {}
+
+        return null;
+    }
+
+    function getMMKVManager() {
+        try {
+            const nmp = (typeof window !== "undefined" && window.nativeModuleProxy) || 
+                        (typeof globalThis !== "undefined" && globalThis.nativeModuleProxy) || 
+                        (typeof global !== "undefined" && global.nativeModuleProxy);
+            if (nmp?.MMKVManager && typeof nmp.MMKVManager.setItem === "function") {
+                return nmp.MMKVManager;
+            }
+        } catch {}
+
+        try {
+            const rn = metro.common?.ReactNative || (typeof ReactNative !== "undefined" ? ReactNative : null);
+            if (rn?.NativeModules?.MMKVManager && typeof rn.NativeModules.MMKVManager.setItem === "function") {
+                return rn.NativeModules.MMKVManager;
+            }
+        } catch {}
+
+        try {
+            const mmkv = findByProps("getItem", "setItem");
+            if (mmkv && typeof mmkv.setItem === "function") return mmkv;
+        } catch {}
+
+        return null;
+    }
+
+    function getPluginRegistryEntry() {
+        try {
+            const pList = mod.plugins?.plugins || 
+                          root.vendetta?.plugins?.plugins || 
+                          root.bunny?.plugins?.plugins || 
+                          root.kettu?.plugins?.plugins;
+            if (pList) {
+                for (const [id, p] of Object.entries(pList)) {
+                    if (p?.manifest?.name === "FakeDMs" || id.includes("fakedm") || id.includes("revenge-fakedms")) {
+                        return p;
+                    }
+                }
             }
         } catch {}
         return null;
@@ -116,28 +176,50 @@
                 }
             }
             const json = JSON.stringify(data);
+            const activeBackends = [];
 
-            // 1. AsyncStorage (Discord React Native)
+            // 1. Vendetta / Bunny / Kettu Plugin Persistent Object
             try {
-                const storage = getAsyncStorage();
-                if (storage && typeof storage.setItem === "function") {
-                    await storage.setItem(STORAGE_KEY, json);
+                const p = getPluginRegistryEntry();
+                if (p) {
+                    if (p.storage && typeof p.storage === "object") {
+                        p.storage.savedMessages = json;
+                    }
+                    p.savedMessages = json;
+                    activeBackends.push("PluginStorage");
                 }
             } catch {}
 
-            // 2. Kettu / Bunny / Vendetta storage
+            // 2. Native MMKV Storage
+            try {
+                const mmkv = getMMKVManager();
+                if (mmkv && typeof mmkv.setItem === "function") {
+                    await mmkv.setItem(STORAGE_KEY, json);
+                    activeBackends.push("MMKV");
+                }
+            } catch {}
+
+            // 3. Native File System (Documents directory)
+            try {
+                const fm = getFileManager();
+                if (fm && typeof fm.writeFile === "function") {
+                    await fm.writeFile("documents", FILE_NAME, json, "utf8");
+                    activeBackends.push("FileSystem");
+                }
+            } catch {}
+
+            // 4. Fallback in-memory/localStorage
             try {
                 if (mod.storage && typeof mod.storage === "object") {
                     mod.storage[STORAGE_KEY] = json;
                 }
-            } catch {}
-
-            // 3. localStorage (Hermes/JSC global runtime)
-            try {
-                if (typeof localStorage !== "undefined" && localStorage && typeof localStorage.setItem === "function") {
+                if (typeof localStorage !== "undefined" && localStorage?.setItem) {
                     localStorage.setItem(STORAGE_KEY, json);
                 }
             } catch {}
+
+            storageBackendUsed = activeBackends.length > 0 ? activeBackends.join(" + ") : "In-Memory";
+            console.log(`[FakeDMs] Saved to persistent store (${storageBackendUsed})`);
         } catch (e) {
             console.error("[FakeDMs] Error saving persistent messages:", e);
         }
@@ -146,29 +228,55 @@
     async function loadPersistentStore() {
         try {
             let json = null;
+            let loadedFrom = null;
 
-            // 1. AsyncStorage
+            // 1. Try Vendetta / Bunny / Kettu Plugin Persistent Object
             try {
-                const storage = getAsyncStorage();
-                if (storage && typeof storage.getItem === "function") {
-                    json = await storage.getItem(STORAGE_KEY);
+                const p = getPluginRegistryEntry();
+                if (p) {
+                    if (p.storage && p.storage.savedMessages) {
+                        json = p.storage.savedMessages;
+                        loadedFrom = "PluginStorage";
+                    } else if (p.savedMessages) {
+                        json = p.savedMessages;
+                        loadedFrom = "PluginStorage";
+                    }
                 }
             } catch {}
 
-            // 2. Mod storage
+            // 2. Try Native MMKV Storage
             if (!json) {
                 try {
-                    if (mod.storage && mod.storage[STORAGE_KEY]) {
-                        json = mod.storage[STORAGE_KEY];
+                    const mmkv = getMMKVManager();
+                    if (mmkv && typeof mmkv.getItem === "function") {
+                        json = await mmkv.getItem(STORAGE_KEY);
+                        if (json) loadedFrom = "MMKV";
                     }
                 } catch {}
             }
 
-            // 3. localStorage
+            // 3. Try Native File System
             if (!json) {
                 try {
-                    if (typeof localStorage !== "undefined" && localStorage && typeof localStorage.getItem === "function") {
+                    const fm = getFileManager();
+                    if (fm && typeof fm.readFile === "function") {
+                        const docsPath = fm.getConstants?.().DocumentsDirPath || "";
+                        const fullPath = docsPath ? `${docsPath}/${FILE_NAME}` : FILE_NAME;
+                        json = await fm.readFile(fullPath, "utf8");
+                        if (json) loadedFrom = "FileSystem";
+                    }
+                } catch {}
+            }
+
+            // 4. Try mod.storage / localStorage
+            if (!json) {
+                try {
+                    if (mod.storage && mod.storage[STORAGE_KEY]) {
+                        json = mod.storage[STORAGE_KEY];
+                        loadedFrom = "ModStorage";
+                    } else if (typeof localStorage !== "undefined" && localStorage?.getItem) {
                         json = localStorage.getItem(STORAGE_KEY);
+                        if (json) loadedFrom = "LocalStorage";
                     }
                 } catch {}
             }
@@ -182,7 +290,8 @@
                             fakeMessagesByChannel.set(chId, msgs);
                         }
                     }
-                    console.log("[FakeDMs] Loaded persistent messages for channels:", Object.keys(parsed).length);
+                    storageBackendUsed = loadedFrom || "Restored";
+                    console.log(`[FakeDMs] Restored ${fakeMessagesByChannel.size} channels from storage (${storageBackendUsed})`);
                 }
             }
         } catch (e) {
@@ -581,6 +690,10 @@
         const [updateTick, setUpdateTick] = React.useState(0);
         const triggerUpdate = () => setUpdateTick((t) => t + 1);
 
+        React.useEffect(() => {
+            loadPersistentStore().then(() => triggerUpdate());
+        }, []);
+
         const currentFakes = (targetChannelId && fakeMessagesByChannel.get(targetChannelId)) || [];
         const injectedCount = currentFakes.length;
 
@@ -860,10 +973,13 @@
                 })
             ) : null,
 
-            // Quick hint
+            // Storage status badge & quick hint
             React.createElement(Text, {
-                style: { color: "#6d6f78", fontSize: 11, textAlign: "center", marginTop: 10 }
-            }, "Messages are permanently saved to your device until you press Delete. Loads silently in background.")
+                style: { color: "#23a55a", fontSize: 11, textAlign: "center", marginTop: 10, fontWeight: "600" }
+            }, `💾 Storage: ${storageBackendUsed} (${injectedCount} saved in this DM)`),
+            React.createElement(Text, {
+                style: { color: "#6d6f78", fontSize: 11, textAlign: "center", marginTop: 3 }
+            }, "Messages persist across app restarts until you press Delete.")
         );
     }
 
@@ -896,35 +1012,77 @@
                 }
             });
 
-            // 1. Auto-Restore Injected Messages When Switching/Loading Channels
-            if (FluxDispatcher?.subscribe) {
-                try {
-                    const handleFluxEvent = (event) => {
-                        if (!event) return;
-                        const eventType = event.type;
-                        if (eventType === "LOAD_MESSAGES_SUCCESS" || eventType === "CHANNEL_SELECT") {
-                            const chId = event.channelId;
+            // 1. Intercept Server Message Loads & Auto-Restore Across DMs
+            let dispatchPatched = false;
+            let fluxSubscribed = false;
+
+            const setupFluxHooks = () => {
+                initModules();
+
+                // Hook dispatch so LOAD_MESSAGES_SUCCESS includes our fake messages natively
+                if (patcher?.before && FluxDispatcher?.dispatch && !dispatchPatched) {
+                    try {
+                        const unpatchDispatch = patcher.before("dispatch", FluxDispatcher, (args) => {
+                            const event = args?.[0];
+                            if (!event) return;
+
+                            if (event.type === "LOAD_MESSAGES_SUCCESS") {
+                                const chId = event.channelId;
+                                if (chId && fakeMessagesByChannel.has(chId)) {
+                                    const fakes = fakeMessagesByChannel.get(chId);
+                                    if (Array.isArray(fakes) && fakes.length > 0 && Array.isArray(event.messages)) {
+                                        const existingIds = new Set(event.messages.map((m) => m?.id));
+                                        for (const fake of fakes) {
+                                            if (!existingIds.has(fake.id)) {
+                                                event.messages.push(fake);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        unpatches.push(unpatchDispatch);
+                        dispatchPatched = true;
+                        console.log("[FakeDMs] Patched FluxDispatcher.dispatch for LOAD_MESSAGES_SUCCESS");
+                    } catch (e) {
+                        console.error("[FakeDMs] Error patching dispatch:", e);
+                    }
+                }
+
+                // Subscribe as backup event trigger
+                if (FluxDispatcher?.subscribe && !fluxSubscribed) {
+                    try {
+                        const handleFluxEvent = (event) => {
+                            if (!event) return;
+                            const chId = event.channelId || SelectedChannelStore?.getChannelId();
                             if (chId && fakeMessagesByChannel.has(chId)) {
                                 setTimeout(() => restoreFakeMessages(chId), 120);
                                 setTimeout(() => restoreFakeMessages(chId), 500);
                                 setTimeout(() => restoreFakeMessages(chId), 1200);
                             }
-                        }
-                    };
+                        };
 
-                    FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
-                    FluxDispatcher.subscribe("CHANNEL_SELECT", handleFluxEvent);
+                        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
+                        FluxDispatcher.subscribe("CHANNEL_SELECT", handleFluxEvent);
 
-                    unpatches.push(() => {
-                        try {
-                            FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
-                            FluxDispatcher.unsubscribe("CHANNEL_SELECT", handleFluxEvent);
-                        } catch {}
-                    });
-                } catch (e) {
-                    console.error("[FakeDMs] Flux subscribe error:", e);
+                        unpatches.push(() => {
+                            try {
+                                FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
+                                FluxDispatcher.unsubscribe("CHANNEL_SELECT", handleFluxEvent);
+                            } catch {}
+                        });
+                        fluxSubscribed = true;
+                        console.log("[FakeDMs] Subscribed to Flux events");
+                    } catch (e) {
+                        console.error("[FakeDMs] Error subscribing to Flux:", e);
+                    }
                 }
-            }
+            };
+
+            setupFluxHooks();
+            setTimeout(setupFluxHooks, 500);
+            setTimeout(setupFluxHooks, 1500);
+            setTimeout(setupFluxHooks, 3000);
 
             // ════════════════════════════════════════════════════════════════════
             // 1. Hook the + Button and Chat Action Sheets to add "⚡ Fake DM"
