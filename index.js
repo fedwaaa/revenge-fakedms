@@ -11,6 +11,61 @@
     const toasts = mod.ui?.toasts || {};
     const utils = mod.utils || {};
 
+    // ── Silence "FakeDM enabled" / "FakeDMs enabled" Toast Popups ─────────────
+    function suppressEnabledToast() {
+        try {
+            const isTarget = (arg) => {
+                if (!arg) return false;
+                const str = typeof arg === "string" ? arg : (arg.content || arg.title || arg.message || JSON.stringify(arg));
+                return /(?=.*fakedm)(?=.*(enabled|loaded|active))/i.test(String(str));
+            };
+
+            const patchTarget = (obj) => {
+                if (!obj || typeof obj.showToast !== "function" || obj.__fakedm_silent) return;
+                try {
+                    const orig = obj.showToast;
+                    obj.showToast = function (...args) {
+                        if (isTarget(args[0])) {
+                            return;
+                        }
+                        return orig.apply(this, args);
+                    };
+                    obj.__fakedm_silent = true;
+                } catch {}
+            };
+
+            patchTarget(toasts);
+            patchTarget(mod.ui?.toasts);
+            patchTarget(root.vendetta?.ui?.toasts);
+            patchTarget(root.bunny?.ui?.toasts);
+            patchTarget(root.kettu?.ui?.toasts);
+
+            try {
+                const metroToast = metro.findByProps ? metro.findByProps("showToast") : null;
+                if (metroToast) patchTarget(metroToast);
+            } catch {}
+
+            if (patcher?.instead && toasts?.showToast) {
+                try {
+                    patcher.instead("showToast", toasts, (args, orig) => {
+                        if (isTarget(args[0])) return;
+                        return orig(...args);
+                    });
+                } catch {}
+            }
+            if (patcher?.instead && mod.ui?.toasts?.showToast) {
+                try {
+                    patcher.instead("showToast", mod.ui.toasts, (args, orig) => {
+                        if (isTarget(args[0])) return;
+                        return orig(...args);
+                    });
+                } catch {}
+            }
+        } catch {}
+    }
+
+    suppressEnabledToast();
+
     const findByProps = (...props) => metro.findByProps ? metro.findByProps(...props) : null;
     const findInReactTree = utils.findInReactTree || ((tree, filter) => {
         const stack = [tree];
@@ -206,6 +261,7 @@
             const common = metro.common || {};
             React = common.React || root.React;
             ReactNative = common.ReactNative || root.ReactNative || findByProps("View", "Text");
+            suppressEnabledToast();
         } catch (e) {
             console.error("[FakeDMs] Error resolving Metro modules:", e);
         }
@@ -828,6 +884,7 @@
     const plugin = {
         onLoad: () => {
             initModules();
+            suppressEnabledToast();
             unpatches = [];
 
             // 0. Silently load persistent messages from device storage in background
