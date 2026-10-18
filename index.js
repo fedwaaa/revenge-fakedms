@@ -1,7 +1,4 @@
-
-Here is the fully corrected code. I have completely removed all silent-flag logic, added forced UI updates to strip the icon from cached messages, and implemented a multi-stage ACK system to guarantee the unread "1" badge is wiped as soon as you leave the DM.
-
-```javascript
+``javascript
 (() => {
     "use strict";
 
