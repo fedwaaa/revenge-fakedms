@@ -285,10 +285,21 @@
                 const parsed = typeof json === "string" ? JSON.parse(json) : json;
                 if (parsed && typeof parsed === "object") {
                     fakeMessagesByChannel.clear();
+                    let stripped = false;
                     for (const [chId, msgs] of Object.entries(parsed)) {
                         if (Array.isArray(msgs) && msgs.length > 0) {
-                            fakeMessagesByChannel.set(chId, msgs);
+                            const cleaned = msgs.map((m) => {
+                                if (m && typeof m === "object" && ((m.flags || 0) & 4096)) {
+                                    stripped = true;
+                                    return { ...m, flags: (m.flags || 0) & ~4096 };
+                                }
+                                return m;
+                            });
+                            fakeMessagesByChannel.set(chId, cleaned);
                         }
+                    }
+                    if (stripped) {
+                        savePersistentStore();
                     }
                     storageBackendUsed = loadedFrom || "Restored";
                     console.log(`[FakeDMs] Restored ${fakeMessagesByChannel.size} channels from storage (${storageBackendUsed})`);
@@ -552,7 +563,7 @@
         initModules();
         if (!FluxDispatcher?.dispatch) return;
 
-        // Check if messages already exist in channel store to prevent duplicate pings
+        // Check if messages already exist in channel store to prevent duplicate rendering
         const existingIds = new Set();
         try {
             const MessageStore = findByProps("getMessages", "getMessage");
@@ -566,15 +577,14 @@
         } catch {}
 
         for (const msg of list) {
-            if (existingIds.has(msg.id)) continue; // Already in chat view, skip to prevent ping sound!
-
+            if (existingIds.has(msg.id)) continue;
             try {
                 FluxDispatcher.dispatch({
                     type: "MESSAGE_CREATE",
                     channelId: channelId,
                     message: {
                         ...msg,
-                        flags: (msg.flags || 0) | 4096 // 4096 = SUPPRESS_NOTIFICATIONS (silent)
+                        flags: (msg.flags || 0) & ~4096
                     },
                     optimistic: false,
                     sendMessageOptions: {},
@@ -649,14 +659,14 @@
             timestamp: new Date().toISOString(),
             edited_timestamp: null,
             tts: false,
-            mention_everyone: false,
+            mention_everyone: mentionEveryone,
             mentions: mentions,
             mention_roles: [],
             attachments: attachments,
             embeds: [],
             reactions: [],
             pinned: false,
-            flags: 4096 // 4096 = SUPPRESS_NOTIFICATIONS (silent, no ping sound)
+            flags: 0
         };
 
         // Save to persistent channel list & write to storage
@@ -1022,49 +1032,47 @@
             unpatches = [];
 
             // 0. Silently load persistent messages from device storage in background
-            loadPersistentStore();
+            loadPersistentStore().then(() => {
+                const activeCh = SelectedChannelStore?.getChannelId();
+                if (activeCh && fakeMessagesByChannel.has(activeCh)) {
+                    setTimeout(() => restoreFakeMessages(activeCh), 200);
+                    setTimeout(() => restoreFakeMessages(activeCh), 800);
+                }
+            });
 
-            // 1. Intercept Server Message Loads & Auto-Restore Across DMs Silently
+            // 1. Intercept Server Message Loads & Auto-Restore Across DMs
             let dispatchPatched = false;
             let fluxSubscribed = false;
 
             const setupFluxHooks = () => {
                 initModules();
 
-                // Hook dispatch so LOAD_MESSAGES_SUCCESS includes our fake messages natively and silently
+                // Hook dispatch so LOAD_MESSAGES_SUCCESS includes our fake messages natively
                 if (patcher?.before && FluxDispatcher?.dispatch && !dispatchPatched) {
                     try {
                         const unpatchDispatch = patcher.before("dispatch", FluxDispatcher, (args) => {
                             const event = args?.[0];
                             if (!event) return;
 
-                            // 1. Silent native insertion on server message load
                             if (event.type === "LOAD_MESSAGES_SUCCESS") {
                                 const chId = event.channelId;
                                 if (chId && fakeMessagesByChannel.has(chId)) {
                                     const fakes = fakeMessagesByChannel.get(chId);
                                     if (Array.isArray(fakes) && fakes.length > 0 && Array.isArray(event.messages)) {
-                                        const existingIds = new Set(event.messages.map((m) => m?.id));
-                                        for (const fake of fakes) {
-                                            if (!existingIds.has(fake.id)) {
-                                                event.messages.push({
-                                                    ...fake,
-                                                    flags: (fake.flags || 0) | 4096 // 4096 = SUPPRESS_NOTIFICATIONS
-                                                });
-                                            }
+                                        const existingMap = new Map();
+                                        for (const m of event.messages) {
+                                            if (m?.id) existingMap.set(m.id, m);
                                         }
-                                    }
-                                }
-                            }
-
-                            // 2. Intercept and kill any sound/ping notification for fake messages
-                            if (event.type === "NOTIFICATION_CREATE" || event.type === "MESSAGE_ACK") {
-                                const targetId = event.message?.id || event.messageId || event.id;
-                                if (targetId) {
-                                    for (const fakes of fakeMessagesByChannel.values()) {
-                                        if (fakes.some((f) => f.id === targetId)) {
-                                            args[0] = { type: "NOOP" };
-                                            return;
+                                        for (const fake of fakes) {
+                                            const clean = { ...fake, flags: (fake.flags || 0) & ~4096 };
+                                            const existing = existingMap.get(clean.id);
+                                            if (existing) {
+                                                if ((existing.flags || 0) & 4096) {
+                                                    existing.flags = (existing.flags || 0) & ~4096;
+                                                }
+                                                continue;
+                                            }
+                                            event.messages.push(clean);
                                         }
                                     }
                                 }
@@ -1072,30 +1080,36 @@
                         });
                         unpatches.push(unpatchDispatch);
                         dispatchPatched = true;
+                        console.log("[FakeDMs] Patched FluxDispatcher.dispatch for LOAD_MESSAGES_SUCCESS");
                     } catch (e) {
                         console.error("[FakeDMs] Error patching dispatch:", e);
                     }
                 }
 
-                // Subscribe ONLY to CHANNEL_SELECT for cached channel switching (no redundant pings)
+                // Subscribe as backup event trigger
                 if (FluxDispatcher?.subscribe && !fluxSubscribed) {
                     try {
                         const handleFluxEvent = (event) => {
                             if (!event) return;
                             const chId = event.channelId || SelectedChannelStore?.getChannelId();
                             if (chId && fakeMessagesByChannel.has(chId)) {
-                                setTimeout(() => restoreFakeMessages(chId), 200);
+                                setTimeout(() => restoreFakeMessages(chId), 120);
+                                setTimeout(() => restoreFakeMessages(chId), 500);
+                                setTimeout(() => restoreFakeMessages(chId), 1200);
                             }
                         };
 
+                        FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
                         FluxDispatcher.subscribe("CHANNEL_SELECT", handleFluxEvent);
 
                         unpatches.push(() => {
                             try {
+                                FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", handleFluxEvent);
                                 FluxDispatcher.unsubscribe("CHANNEL_SELECT", handleFluxEvent);
                             } catch {}
                         });
                         fluxSubscribed = true;
+                        console.log("[FakeDMs] Subscribed to Flux events");
                     } catch (e) {
                         console.error("[FakeDMs] Error subscribing to Flux:", e);
                     }
