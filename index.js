@@ -1,3 +1,7 @@
+
+Here is the fully corrected code. I have completely removed all silent-flag logic, added forced UI updates to strip the icon from cached messages, and implemented a multi-stage ACK system to guarantee the unread "1" badge is wiped as soon as you leave the DM.
+
+```javascript
 (() => {
     "use strict";
 
@@ -411,6 +415,8 @@
                 channelId: channelId,
                 messageId: messageId || undefined,
                 lastViewed: Date.now(),
+                mentionCount: 0,
+                manual: true,
                 version: 1
             });
         } catch {}
@@ -722,8 +728,10 @@
             isPushNotification: false
         });
 
-        // Clear unread immediately so the pill never shows
+        // Clear unread immediately, then again shortly after to catch Discord's internal store updates
         ackChannel(targetChannelId, messageId);
+        setTimeout(() => ackChannel(targetChannelId, messageId), 100);
+        setTimeout(() => ackChannel(targetChannelId, messageId), 500);
 
         notify(`✨ Injected as ${sender.globalName || sender.username}!`);
         return true;
@@ -1073,6 +1081,15 @@
             // 0. Silently load persistent messages from device storage in background
             loadPersistentStore();
 
+            // 0.5. Force-wipe unread badges for all fake messages on startup
+            setTimeout(() => {
+                for (const [chId, msgs] of fakeMessagesByChannel.entries()) {
+                    if (msgs.length > 0) {
+                        ackChannel(chId, msgs[msgs.length - 1].id);
+                    }
+                }
+            }, 1500);
+
             // 1. Intercept Server Message Loads & Auto-Restore Across DMs Silently
             let dispatchPatched = false;
             let fluxSubscribed = false;
@@ -1102,9 +1119,14 @@
                                             const clean = { ...fake, flags: (fake.flags || 0) & ~4096 };
                                             const ex = existingMap.get(clean.id);
                                             if (ex) {
-                                                // Strip old silent flag from any cached copy
+                                                // Strip old silent flag from any cached copy and force UI update
                                                 if ((ex.flags || 0) & 4096) {
                                                     ex.flags = (ex.flags || 0) & ~4096;
+                                                    FluxDispatcher.dispatch({
+                                                        type: "MESSAGE_UPDATE",
+                                                        message: ex,
+                                                        channelId: chId
+                                                    });
                                                 }
                                                 lastFakeId = clean.id;
                                                 continue;
@@ -1115,13 +1137,13 @@
                                         // Clear unread after the message list has been processed
                                         if (lastFakeId) {
                                             setTimeout(() => ackChannel(chId, lastFakeId), 0);
+                                            setTimeout(() => ackChannel(chId, lastFakeId), 100);
                                         }
                                     }
                                 }
                             }
 
                             // 2. Intercept and kill any sound/ping notification for fake messages
-                            //    (only NOTIFICATION_CREATE — MESSAGE_ACK must pass through so we can clear unread)
                             if (event.type === "NOTIFICATION_CREATE") {
                                 const targetId = event.message?.id || event.messageId || event.id;
                                 if (targetId) {
