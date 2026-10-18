@@ -90,6 +90,7 @@
     const STORAGE_KEY = "FAKEDMS_MESSAGES_DATA_V3";
     const FILE_NAME = "fakedms_messages.json";
     let storageBackendUsed = "Initializing...";
+    let didMigrateSilentFlag = false;
 
     function getFileManager() {
         try {
@@ -172,7 +173,8 @@
             const data = {};
             for (const [chId, msgs] of fakeMessagesByChannel.entries()) {
                 if (Array.isArray(msgs) && msgs.length > 0) {
-                    data[chId] = msgs;
+                    // Never persist the silent flag
+                    data[chId] = msgs.map((m) => ({ ...m, flags: (m.flags || 0) & ~4096 }));
                 }
             }
             const json = JSON.stringify(data);
@@ -285,13 +287,27 @@
                 const parsed = typeof json === "string" ? JSON.parse(json) : json;
                 if (parsed && typeof parsed === "object") {
                     fakeMessagesByChannel.clear();
+                    let strippedAny = false;
                     for (const [chId, msgs] of Object.entries(parsed)) {
                         if (Array.isArray(msgs) && msgs.length > 0) {
-                            fakeMessagesByChannel.set(chId, msgs);
+                            const cleaned = msgs.map((m) => {
+                                if (m && typeof m === "object" && ((m.flags || 0) & 4096)) {
+                                    strippedAny = true;
+                                    return { ...m, flags: (m.flags || 0) & ~4096 };
+                                }
+                                return m;
+                            });
+                            fakeMessagesByChannel.set(chId, cleaned);
                         }
                     }
                     storageBackendUsed = loadedFrom || "Restored";
                     console.log(`[FakeDMs] Restored ${fakeMessagesByChannel.size} channels from storage (${storageBackendUsed})`);
+
+                    // One-time migration: rewrite store without the silent flag
+                    if (strippedAny && !didMigrateSilentFlag) {
+                        didMigrateSilentFlag = true;
+                        savePersistentStore();
+                    }
                 }
             }
         } catch (e) {
@@ -383,6 +399,26 @@
             } else {
                 console.log("[FakeDMs]", text);
             }
+        } catch {}
+    }
+
+    // ── Mark a channel read so the unread pill never appears ─────────────────
+    function ackChannel(channelId, messageId) {
+        if (!channelId || !FluxDispatcher?.dispatch) return;
+        try {
+            FluxDispatcher.dispatch({
+                type: "MESSAGE_ACK",
+                channelId: channelId,
+                messageId: messageId || undefined,
+                lastViewed: Date.now(),
+                version: 1
+            });
+        } catch {}
+        try {
+            FluxDispatcher.dispatch({
+                type: "CHANNEL_ACK",
+                channelId: channelId
+            });
         } catch {}
     }
 
@@ -565,8 +601,14 @@
             }
         } catch {}
 
+        let lastId = null;
+
         for (const msg of list) {
-            if (existingIds.has(msg.id)) continue; // Already in chat view, skip to prevent ping sound!
+            const cleanFlags = (msg.flags || 0) & ~4096; // strip silent flag
+            if (existingIds.has(msg.id)) {
+                lastId = msg.id;
+                continue; // Already in chat view, skip to prevent ping sound!
+            }
 
             try {
                 FluxDispatcher.dispatch({
@@ -574,16 +616,20 @@
                     channelId: channelId,
                     message: {
                         ...msg,
-                        flags: (msg.flags || 0) | 4096 // 4096 = SUPPRESS_NOTIFICATIONS (silent)
+                        flags: cleanFlags
                     },
                     optimistic: false,
                     sendMessageOptions: {},
                     isPushNotification: false
                 });
+                lastId = msg.id;
             } catch (e) {
                 console.error("[FakeDMs] Error restoring message:", e);
             }
         }
+
+        // Mark the DM read so no unread pill / "1 message" appears
+        ackChannel(channelId, lastId || (list[list.length - 1] && list[list.length - 1].id));
     }
 
     // ── Core Injection Engine ────────────────────────────────────────────────
@@ -656,7 +702,7 @@
             embeds: [],
             reactions: [],
             pinned: false,
-            flags: 4096 // 4096 = SUPPRESS_NOTIFICATIONS (silent, no ping sound)
+            flags: 0 // No silent flag — no "silent mode" label
         };
 
         // Save to persistent channel list & write to storage
@@ -675,6 +721,9 @@
             sendMessageOptions: {},
             isPushNotification: false
         });
+
+        // Clear unread immediately so the pill never shows
+        ackChannel(targetChannelId, messageId);
 
         notify(`✨ Injected as ${sender.globalName || sender.username}!`);
         return true;
@@ -1044,21 +1093,36 @@
                                 if (chId && fakeMessagesByChannel.has(chId)) {
                                     const fakes = fakeMessagesByChannel.get(chId);
                                     if (Array.isArray(fakes) && fakes.length > 0 && Array.isArray(event.messages)) {
-                                        const existingIds = new Set(event.messages.map((m) => m?.id));
+                                        const existingMap = new Map();
+                                        for (const m of event.messages) {
+                                            if (m?.id) existingMap.set(m.id, m);
+                                        }
+                                        let lastFakeId = null;
                                         for (const fake of fakes) {
-                                            if (!existingIds.has(fake.id)) {
-                                                event.messages.push({
-                                                    ...fake,
-                                                    flags: (fake.flags || 0) | 4096 // 4096 = SUPPRESS_NOTIFICATIONS
-                                                });
+                                            const clean = { ...fake, flags: (fake.flags || 0) & ~4096 };
+                                            const ex = existingMap.get(clean.id);
+                                            if (ex) {
+                                                // Strip old silent flag from any cached copy
+                                                if ((ex.flags || 0) & 4096) {
+                                                    ex.flags = (ex.flags || 0) & ~4096;
+                                                }
+                                                lastFakeId = clean.id;
+                                                continue;
                                             }
+                                            event.messages.push(clean);
+                                            lastFakeId = clean.id;
+                                        }
+                                        // Clear unread after the message list has been processed
+                                        if (lastFakeId) {
+                                            setTimeout(() => ackChannel(chId, lastFakeId), 0);
                                         }
                                     }
                                 }
                             }
 
                             // 2. Intercept and kill any sound/ping notification for fake messages
-                            if (event.type === "NOTIFICATION_CREATE" || event.type === "MESSAGE_ACK") {
+                            //    (only NOTIFICATION_CREATE — MESSAGE_ACK must pass through so we can clear unread)
+                            if (event.type === "NOTIFICATION_CREATE") {
                                 const targetId = event.message?.id || event.messageId || event.id;
                                 if (targetId) {
                                     for (const fakes of fakeMessagesByChannel.values()) {
